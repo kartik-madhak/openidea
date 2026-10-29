@@ -312,3 +312,29 @@ describe("fallback indentation for GDScript", () => {
     expect(show(v)).toBe("func test() -> void:\n\t|");
   });
 });
+
+describe("fallback indentation boundaries", () => {
+  const fallback = (id: string, lineComment = "#") =>
+    commentTokens({
+      id,
+      name: id,
+      extensions: [],
+      uiMode: null,
+      lineComment,
+      blockComment: null,
+      indent: null,
+    });
+  it.each([
+    ["gdscript", "var items = {|}", "var items = {\n  |\n}"],
+    ["gdscript", 'var text = "unfinished:|', 'var text = "unfinished:\n|'],
+    ["gdscript", 'var text = "unfinished {|', 'var text = "unfinished {\n|'],
+    ["gdscript", 'var text = "#" # comment:|', 'var text = "#" # comment:\n|'],
+    ["gdscript", "if ready: # note|", "if ready: # note\n  |"],
+    ["elixir", "if ready, do: value|", "if ready, do: value\n|"],
+    ["lua", "if ready then work() end|", "if ready then work() end\n|"],
+  ])("handles %s: %s", (id, input, expected) => {
+    const v = make(input, fallback(id));
+    insertNewlineAndIndent(v);
+    expect(show(v)).toBe(expected);
+  });
+});

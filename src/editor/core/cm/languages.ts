@@ -16,7 +16,6 @@ import { styleTags, tags as t } from "@lezer/highlight";
 import { languages as languageData } from "@codemirror/language-data";
 import type { DocBackend, LanguageInfo } from "../backend";
 import { _languageMode } from "@/editor/api";
-import { codeEnd } from "./editing";
 
 let infos: Map<string, LanguageInfo> | null = null;
 let infosPromise: Promise<Map<string, LanguageInfo>> | null = null;
@@ -136,6 +135,7 @@ function opensBlock(code: string, language: string | undefined): boolean {
   if (!code) return false;
   if (/[{([]$/.test(code)) return true;
   if (COLON_INDENT_LANGS.has(language ?? "") && code.endsWith(":")) return true;
+  if (language === "elixir") return /\bdo$|->$/.test(code);
   if (KEYWORD_OPEN_LANGS.has(language ?? "") && !/\bend$/.test(code) && KEYWORD_OPEN.test(code)) return true;
   return false;
 }
@@ -143,6 +143,24 @@ function opensBlock(code: string, language: string | undefined): boolean {
 function dedentsAfter(code: string, language: string | undefined): boolean {
   if (!COLON_INDENT_LANGS.has(language ?? "")) return false;
   return DEDENT_STATEMENT.test(code) && !/[,\\]$/.test(code);
+}
+
+/** Hide literal contents before interpreting punctuation as block syntax. */
+function indentationCode(text: string, lineComment: string | undefined): string {
+  let code = "";
+  let quote: string | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (quote) {
+      if (ch === "\\") i++;
+      else if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      code += "x";
+    } else if (lineComment && text.startsWith(lineComment, i)) break;
+    else code += ch;
+  }
+  return code.trimEnd();
 }
 
 /**
@@ -154,22 +172,23 @@ export function fallbackIndent(language?: string): Extension {
   return indentService.of((cx, pos) => {
     if (cx.state.facet(languageFacet)) return undefined;
     const lineComment = cx.state.languageDataAt<{ line?: string }>("commentTokens", pos)[0]?.line;
-    const stripComment = (text: string) => text.slice(0, codeEnd(text, lineComment)).trimEnd();
+    const stripComment = (text: string) => indentationCode(text, lineComment);
 
     const after = cx.textAfterPos(pos);
     const closingBracket = /^\s*[}\])]/.test(after);
 
     if (cx.simulatedBreak != null) {
-      const before = cx.lineAt(pos, -1);
-      if (/\S/.test(before.text)) {
-        const base = cx.lineIndent(pos, -1);
-        const code = stripComment(before.text);
+      const line = cx.state.doc.lineAt(pos);
+      const before = line.text.slice(0, pos - line.from);
+      const base = cx.countColumn(before, before.search(/\S|$/));
+      if (/\S/.test(before)) {
+        const code = stripComment(before);
         if (closingBracket) return /[{([]$/.test(code) ? base : Math.max(0, base - cx.unit);
         if (opensBlock(code, language)) return base + cx.unit;
         if (dedentsAfter(code, language)) return Math.max(0, base - cx.unit);
         return base;
       }
-      return cx.lineIndent(pos, -1);
+      return base;
     }
 
     const curLine = cx.state.doc.lineAt(pos);
