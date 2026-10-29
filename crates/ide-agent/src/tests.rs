@@ -1,19 +1,24 @@
 //! End-to-end task flow against an in-memory ACP agent.
 
 use super::*;
-use std::sync::OnceLock;
 use tokio::io::duplex;
 
 /// Says "Hi", edits a file, asks to run a command and reports what it was allowed.
 #[derive(Default)]
 struct FakeAgent {
-    peer: OnceLock<Peer>,
+    /// Every connection's agent side, kept open.
+    servers: Mutex<Vec<Peer>>,
     calls: Mutex<Vec<String>>,
 }
 
 impl FakeAgent {
+    /// The connection opened last: the agent restarted, or a fork's.
+    fn latest(&self) -> Peer {
+        self.servers.lock().last().cloned().expect("a connection")
+    }
+
     fn update(&self, session: &str, update: Value) {
-        let peer = self.peer.get().unwrap();
+        let peer = self.latest();
         peer.notify("session/update", json!({ "sessionId": session, "update": update })).unwrap();
     }
 
@@ -43,7 +48,7 @@ impl FakeAgent {
             json!({"sessionUpdate": "tool_call", "toolCallId": "c1-t1", "title": "Read lexer.rs",
             "kind": "read", "status": "completed"}),
         );
-        let peer = self.peer.get().unwrap().clone();
+        let peer = self.latest();
         let _: Value = tokio::runtime::Handle::current()
             .block_on(peer.request(
                 "session/request_permission",
@@ -68,6 +73,14 @@ impl Handler for FakeAgent {
         self.calls.lock().push(method.to_owned());
     }
 
+    fn on_request_with_data(&self, method: &str, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        if method == "session/prompt" && params.pointer("/prompt/0/text") == Some(&json!("limit")) {
+            let data = json!({"openidea": {"usageLimit": {"resetsAtMs": 1234.0}}});
+            return Err((codes::INTERNAL_ERROR, "You've hit your usage limit".into(), Some(data)));
+        }
+        self.on_request(method, params).map_err(|(code, message)| (code, message, None))
+    }
+
     fn on_request(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
         self.calls.lock().push(method.to_owned());
         let session = params.get("sessionId").and_then(Value::as_str).unwrap_or("s1").to_owned();
@@ -76,12 +89,19 @@ impl Handler for FakeAgent {
                 if params.pointer("/clientCapabilities/subagents").is_some_and(Value::is_object) {
                     self.calls.lock().push("subagents".into());
                 }
-                Ok(json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}))
+                Ok(json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true,
+                    "sessionCapabilities": {"fork": {}}, "_meta": {"openidea": {"rollback": true, "steer": true}}}}))
             }
             "session/new" => Ok(json!({"sessionId": "s1",
                 "modes": {"currentModeId": "ask", "availableModes": [{"id": "ask", "name": "Ask"}, {"id": "code", "name": "Code"}]},
                 "configOptions": [{"id": "model", "category": "model", "type": "select", "currentValue": "big",
                     "options": [{"value": "big", "name": "Big"}, {"value": "small", "name": "Small"}]}]})),
+            "session/fork" => Ok(json!({"sessionId": "s2"})),
+            "_openidea/rollback" | "_openidea/steer" => {
+                let detail = params.get("turns").cloned().unwrap_or_else(|| params["prompt"][0]["text"].clone());
+                self.calls.lock().push(format!("{method} {detail}"));
+                Ok(json!({}))
+            }
             "session/load" => {
                 self.say(&session, "replayed history");
                 Ok(json!({}))
@@ -98,6 +118,19 @@ impl Handler for FakeAgent {
                 }
                 if text == "delegate" {
                     self.delegate(&session);
+                    return Ok(json!({"stopReason": "end_turn"}));
+                }
+                if text == "late option" {
+                    // An option the session offers only once it runs.
+                    self.update(
+                        &session,
+                        json!({"sessionUpdate": "config_option_update", "configOptions": [
+                            {"id": "model", "category": "model", "type": "select", "currentValue": "big",
+                             "options": [{"value": "big", "name": "Big"}, {"value": "small", "name": "Small"}]},
+                            {"id": "effort", "category": "thought_level", "type": "select", "currentValue": "low",
+                             "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}]}),
+                    );
+                    self.say(&session, "ok");
                     return Ok(json!({"stopReason": "end_turn"}));
                 }
                 if text == "wait" {
@@ -121,7 +154,7 @@ impl Handler for FakeAgent {
                     "kind": "edit", "status": "completed",
                     "content": [{"type": "diff", "path": "/p/a.rs", "oldText": "a\n", "newText": "b\n"}]}),
                 );
-                let peer = self.peer.get().unwrap().clone();
+                let peer = self.latest();
                 let answer: Value = tokio::runtime::Handle::current()
                     .block_on(peer.request(
                         "session/request_permission",
@@ -150,8 +183,7 @@ fn manager_at(dir: &Path, models_file: &Path, agent: Arc<FakeAgent>) -> AgentMan
         let (ar, aw) = tokio::io::split(a);
         let (br, bw) = tokio::io::split(b);
         let server = Peer::connect_framed(br, bw, agent.clone(), Framing::Lines);
-        // Keep the latest connection: a restarted manager connects again.
-        let _ = agent.peer.set(server);
+        agent.servers.lock().push(server);
         Ok(Peer::connect_framed(ar, aw, client, Framing::Lines))
     });
     AgentManager::with_connector(
@@ -209,12 +241,20 @@ async fn commands_are_remembered_per_project_and_merged_with_skills_on_disk() {
 
 async fn wait_for(mgr: &AgentManager, id: &str, status: AgentStatus) {
     for _ in 0..500 {
-        if mgr.task(id).unwrap().state.lock().task.status == status {
+        let task = mgr.task(id).unwrap();
+        let (current, busy) = {
+            let s = task.state.lock();
+            (s.task.status, s.busy)
+        };
+        // Settled statuses only count once the run is over (a prompt just sent hasn't started).
+        let settled = !matches!(status, AgentStatus::Ready | AgentStatus::Failed | AgentStatus::Limited) || !busy;
+        if current == status && settled {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("task never reached {status:?}");
+    let s = mgr.task(id).unwrap().state.lock().task.status;
+    panic!("task never reached {status:?} (is {s:?})");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -587,4 +627,96 @@ async fn real_claude_task_in_a_worktree() {
     assert!(!repo.join("hello.txt").exists(), "the project checkout is untouched");
     assert!(!mgr.providers().iter().find(|p| p.id == "claude").unwrap().config.is_empty());
     mgr.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forks_rollbacks_and_steering() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = Arc::new(FakeAgent::default());
+    let mgr = manager(tmp.path(), agent.clone());
+    let new = |prompt: &str| NewAgentTask {
+        prompt: text(prompt),
+        provider: "claude".into(),
+        config: Vec::new(),
+        isolation: Isolation::Local,
+        base: None,
+    };
+    let task = mgr.create(new("again")).await.unwrap();
+    wait_for(&mgr, &task.id, AgentStatus::Ready).await;
+    mgr.prompt(&task.id, text("again"), false).await.unwrap();
+    wait_for(&mgr, &task.id, AgentStatus::Ready).await;
+    let caps = mgr.task(&task.id).unwrap().state.lock().task.capabilities;
+    assert!(caps.fork && caps.rollback && caps.steer);
+
+    // A copy from after the first turn: the new task drops the second once it loads.
+    let copy = mgr.fork(&task.id, Some(1)).await.unwrap();
+    assert_eq!(turn_starts(&mgr.entries(&copy.id, None).unwrap()).len(), 1);
+    assert_eq!(mgr.task(&copy.id).unwrap().state.lock().pending_rollback, 1);
+    mgr.prompt(&copy.id, text("again"), false).await.unwrap();
+    wait_for(&mgr, &copy.id, AgentStatus::Ready).await;
+    {
+        let calls = agent.calls.lock();
+        let load = calls.iter().rposition(|c| c == "session/load").unwrap();
+        assert!(calls[load..].iter().any(|c| c == "_openidea/rollback 1"));
+    }
+
+    // Undoing the last turn hands its message back.
+    let undone = mgr.rollback(&task.id, 1).await.unwrap().unwrap();
+    assert_eq!(undone.text, "again");
+    assert_eq!(turn_starts(&mgr.entries(&task.id, None).unwrap()).len(), 1);
+    assert!(agent.calls.lock().iter().any(|c| c == "_openidea/rollback 1"));
+
+    // A message sent now while the agent works joins the turn.
+    mgr.prompt(&task.id, text("wait"), false).await.unwrap();
+    wait_for(&mgr, &task.id, AgentStatus::Running).await;
+    mgr.prompt(&task.id, text("also this"), true).await.unwrap();
+    assert!(agent.calls.lock().iter().any(|c| c == "_openidea/steer \"also this\""));
+    let entries = mgr.entries(&task.id, None).unwrap();
+    assert!(matches!(entries.last(), Some(AgentEntry::User { steered: true, .. })));
+    assert!(mgr.task(&task.id).unwrap().state.lock().task.queue.is_empty());
+    mgr.cancel(&task.id, None).unwrap();
+    wait_for(&mgr, &task.id, AgentStatus::Ready).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_limits_and_late_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = Arc::new(FakeAgent::default());
+    let mgr = manager(tmp.path(), agent.clone());
+    let task = mgr
+        .create(NewAgentTask {
+            prompt: text("limit"),
+            provider: "claude".into(),
+            // `effort` isn't offered until the session runs.
+            config: vec![AgentConfigChoice { id: "effort".into(), value: "high".into() }],
+            isolation: Isolation::Local,
+            base: None,
+        })
+        .await
+        .unwrap();
+    wait_for(&mgr, &task.id, AgentStatus::Limited).await;
+    assert_eq!(mgr.task(&task.id).unwrap().state.lock().task.resets_ms, Some(1234.0));
+
+    mgr.prompt(&task.id, text("late option"), false).await.unwrap();
+    wait_for(&mgr, &task.id, AgentStatus::Ready).await;
+    for _ in 0..100 {
+        if agent.calls.lock().iter().any(|c| c == "session/set_config_option \"high\"") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(agent.calls.lock().iter().any(|c| c == "session/set_config_option \"high\""));
+    let config = mgr.task(&task.id).unwrap().state.lock().task.config.clone();
+    assert_eq!(config.iter().find(|o| o.id == "effort").unwrap().current.as_deref(), Some("high"));
+}
+
+#[test]
+fn retry_updates_become_a_countdown() {
+    let update =
+        json!({"sessionUpdate": RETRY_UPDATE, "attempt": 2, "maxRetries": 10, "retryDelayMs": 1500, "error": ""});
+    assert_eq!(
+        retry_of(&update, 1000.0),
+        Some(AgentRetry { attempt: 2, max_retries: Some(10), retry_at_ms: 2500.0, error: None })
+    );
+    assert_eq!(retry_of(&json!({"sessionUpdate": RETRY_UPDATE}), 0.0), None, "no attempt");
 }

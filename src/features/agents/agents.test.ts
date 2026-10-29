@@ -13,6 +13,7 @@ import {
   nextValue,
   recall,
   toPrompt,
+  retryParts,
   usageLabel,
   workTime,
 } from "./composerModel";
@@ -24,6 +25,7 @@ import {
   findSubagent,
   groupTasks,
   subagentTitle,
+  turnNumbers,
   upsertEntry,
   type SubagentEntry,
 } from "./model";
@@ -186,6 +188,7 @@ describe("agents model", () => {
   it("notifies on finish, failure and questions only", () => {
     expect(attentionChange("running", "ready")).toBe("finished");
     expect(attentionChange("running", "failed")).toBe("failed");
+    expect(attentionChange("running", "limited")).toBe("failed");
     expect(attentionChange("running", "needsInput")).toBe("input");
     expect(attentionChange("needsInput", "running")).toBeNull();
     expect(attentionChange("ready", "archived")).toBeNull();
@@ -236,5 +239,37 @@ describe("agents model", () => {
     expect(html).toContain("<li><div><strong>parent</strong> text:</div><ul>");
     expect(html).toContain("<li>child</li>");
     expect(html).toContain("<li>plain</li>");
+  });
+});
+
+describe("turns", () => {
+  it("numbers the messages that start a turn, not those steered into one", () => {
+    const user = (text: string, steered = false): AgentEntry => ({
+      type: "user",
+      text,
+      attachments: [],
+      sentMs: null,
+      doneMs: null,
+      steered,
+    });
+    const entries: AgentEntry[] = [
+      user("first"),
+      { type: "agent", text: "ok" },
+      user("also", true),
+      user("second"),
+      { type: "agent", text: "done" },
+    ];
+    expect([...turnNumbers(entries)]).toEqual([
+      [0, 0],
+      [3, 1],
+    ]);
+  });
+});
+
+describe("retryParts", () => {
+  it("counts down to the next attempt and shows the limit when known", () => {
+    const retry = { attempt: 3, maxRetries: 10, retryAtMs: 5_400, error: "Connection error." };
+    expect(retryParts(retry, 1_000)).toEqual({ attempt: "3/10", wait: 5 });
+    expect(retryParts({ ...retry, maxRetries: null }, 9_000)).toEqual({ attempt: "3", wait: 0 });
   });
 });

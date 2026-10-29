@@ -2,7 +2,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
-import type { AgentChange, AgentEntry, AgentTask, AgentUsage } from "@/bindings";
+import type { AgentChange, AgentEntry, AgentRetry, AgentTask, AgentUsage } from "@/bindings";
 import { executeAction } from "@/platform/actions";
 import { call, commands, onIdeEvent } from "@/platform/ipc";
 import { basename, relativeDir, useProject } from "@/platform/project";
@@ -25,7 +25,7 @@ import {
 import { useTx, tx } from "@/platform/i18n";
 import { TaskStatusIcon } from "./AgentsView";
 import { Composer } from "./Composer";
-import { canSend, emptyDraft, usageLabel, workTime } from "./composerModel";
+import { canSend, emptyDraft, retryParts, usageLabel, workTime } from "./composerModel";
 import { ConfigPickers } from "./ConfigPickers";
 import { findRanges, formatDuration, formatSentAt } from "./conversation";
 import { Markdown } from "./Markdown";
@@ -39,6 +39,7 @@ import {
   subagentStatusLabel,
   subagentTitle,
   subagentWorking,
+  turnNumbers,
   type SubagentEntry,
 } from "./model";
 import {
@@ -47,8 +48,9 @@ import {
   loadEntries,
   markVisible,
   refreshChanges,
-  editMessage,
   editQueued,
+  forkTask,
+  rerunFrom,
   quoteInComposer,
   removeQueued,
   resendMessage,
@@ -189,6 +191,7 @@ function Header({ task, entries, head }: { task: AgentTask; entries: AgentEntry[
           )}
           {" · "}
           <T>{statusLabel(task.status)}</T>
+          {task.status === "limited" && task.resetsMs != null && ` · ${tx`resets ${formatSentAt(task.resetsMs)}`}`}
         </span>
       </span>
       <Meters task={task} entries={entries} />
@@ -199,6 +202,18 @@ function Header({ task, entries, head }: { task: AgentTask; entries: AgentEntry[
         size="small"
         onClick={() => void executeAction("terminal.openAt", task.cwd)}
       />
+      {!busy && task.status !== "archived" && task.capabilities?.fork && (
+        <IconButton
+          icon="branch"
+          title="Copy to a New Task"
+          size="small"
+          onClick={() =>
+            void forkTask(task.id, null).catch((e: unknown) =>
+              notifications().notify({ level: "error", title: "Couldn't copy the task", body: String(e) }),
+            )
+          }
+        />
+      )}
       {!busy && task.status !== "archived" && (
         <IconButton icon="close" title="Archive Task" size="small" onClick={() => void archiveTask(task.id)} />
       )}
@@ -316,6 +331,8 @@ function Stream({ task, entries, subagent, onOpenSubagent, finding, findFocus, o
   });
   const waiting = entries?.some((e) => e.type === "permission" && !e.chosen);
   const lastUser = entries?.findLast((e): e is UserEntry => e.type === "user");
+  // Forks and undo apply to the task's own turns, not a subagent's conversation.
+  const turns = useMemo(() => (entries && !subagent ? turnNumbers(entries) : null), [entries, subagent]);
   return (
     <div className={styles.streamArea}>
       {finding && <FindBar streamRef={ref} focus={findFocus} onClose={onCloseFind} />}
@@ -343,7 +360,16 @@ function Stream({ task, entries, subagent, onOpenSubagent, finding, findFocus, o
         {entries === null ? (
           <Spinner />
         ) : (
-          entries.map((entry, i) => <Entry key={i} task={task} entry={entry} onOpenSubagent={onOpenSubagent} />)
+          entries.map((entry, i) => (
+            <Entry
+              key={i}
+              task={task}
+              entry={entry}
+              turn={turns?.get(i) ?? null}
+              turnCount={turns?.size ?? 0}
+              onOpenSubagent={onOpenSubagent}
+            />
+          ))
         )}
         {subagent && subagentWorking(subagent.status) && (
           <div className={styles.working}>
@@ -355,7 +381,11 @@ function Stream({ task, entries, subagent, onOpenSubagent, finding, findFocus, o
         {!subagent && (task.status === "running" || task.status === "starting") && !waiting && (
           <div className={styles.working}>
             <Spinner size={12} />
-            <T>{task.status === "starting" ? "Starting the agent…" : "Working…"}</T>
+            {task.retry ? (
+              <Retrying retry={task.retry} />
+            ) : (
+              <T>{task.status === "starting" ? "Starting the agent…" : "Working…"}</T>
+            )}
             {lastUser?.sentMs != null && !lastUser.doneMs && <Elapsed since={lastUser.sentMs} />}
           </div>
         )}
@@ -367,6 +397,20 @@ function Stream({ task, entries, subagent, onOpenSubagent, finding, findFocus, o
 type UserEntry = Extract<AgentEntry, { type: "user" }>;
 
 /** Time since `since`, ticking every second. */
+/** The agent lost its API connection (or was refused) and retries on its own. */
+function Retrying({ retry }: { retry: AgentRetry }) {
+  const tx = useTx();
+  const now = useNow(1000);
+  const { attempt, wait } = retryParts(retry, now);
+  return (
+    <span className={styles.retrying} title={retry.error ?? undefined}>
+      {wait > 0
+        ? tx`API request failed, retrying in ${wait}s (attempt ${attempt})`
+        : tx`API request failed, retrying (attempt ${attempt})`}
+    </span>
+  );
+}
+
 function Elapsed({ since }: { since: number }) {
   const now = useNow(1000);
   return <span className={styles.muted}>{formatDuration(now - since)}</span>;
@@ -551,15 +595,20 @@ const TOOL_ICONS: Record<string, string> = {
 function Entry({
   task,
   entry,
+  turn,
+  turnCount,
   onOpenSubagent,
 }: {
   task: AgentTask;
   entry: AgentEntry;
+  /** Number of the turn this message started (from 0), when it started one. */
+  turn: number | null;
+  turnCount: number;
   onOpenSubagent: (id: string) => void;
 }) {
   switch (entry.type) {
     case "user":
-      return <UserMessage task={task} entry={entry} />;
+      return <UserMessage task={task} entry={entry} turn={turn} turnCount={turnCount} />;
     case "agent":
       return <Markdown text={entry.text} cwd={task.cwd} />;
     case "thought":
@@ -620,11 +669,41 @@ function Entry({
   }
 }
 
-function UserMessage({ task, entry }: { task: AgentTask; entry: UserEntry }) {
+function UserMessage({
+  task,
+  entry,
+  turn,
+  turnCount,
+}: {
+  task: AgentTask;
+  entry: UserEntry;
+  turn: number | null;
+  turnCount: number;
+}) {
   const tx = useTx();
-  const fail = (e: unknown) =>
-    notifications().notify({ level: "error", title: "Couldn't send the message", body: String(e) });
+  const [editing, setEditing] = useState(false);
+  const failed = (title: string) => (e: unknown) => notifications().notify({ level: "error", title, body: String(e) });
+  const fail = failed("Couldn't send the message");
   const archived = task.status === "archived";
+  const idle = !archived && !isBusy(task.status) && turn !== null;
+  const { fork = false, rollback = false } = task.capabilities ?? {};
+  // Editing and running again from a message need an agent that can drop turns.
+  const inPlace = !archived && rollback && turn !== null;
+  // A copy up to an earlier turn drops the later ones from the copied session.
+  const canFork = idle && fork && (rollback || turn === turnCount - 1);
+  if (editing && turn !== null) {
+    return (
+      <MessageEditor
+        initial={entry.text}
+        later={turn < turnCount - 1}
+        onCancel={() => setEditing(false)}
+        onSend={(text) => {
+          setEditing(false);
+          void rerunFrom(task.id, turn, text).catch(fail);
+        }}
+      />
+    );
+  }
   return (
     <div className={styles.message}>
       <div className={styles.user}>
@@ -648,27 +727,89 @@ function UserMessage({ task, entry }: { task: AgentTask; entry: UserEntry }) {
         )}
         {entry.sentMs != null && entry.doneMs != null && (
           <span className={styles.muted} title={tx("Time the agent took to answer")}>
-            {`\u00a0· ${formatDuration(entry.doneMs - entry.sentMs)}`}
+            {` · ${formatDuration(entry.doneMs - entry.sentMs)}`}
           </span>
         )}
         <span className={styles.messageActions}>
           <IconButton icon="copy" title="Copy" size="small" onClick={() => void copyText(entry.text)} />
-          {!archived && entry.text && (
-            <IconButton
-              icon="edit"
-              title="Edit and Resend"
-              size="small"
-              onClick={() => editMessage(task.id, entry.text)}
-            />
+          {inPlace && entry.text && (
+            <IconButton icon="edit" title="Edit" size="small" onClick={() => setEditing(true)} />
           )}
           {!archived && entry.text && entry.attachments.length === 0 && (
             <IconButton
               icon="refresh"
-              title="Send Again"
+              title={inPlace ? "Run Again From Here" : "Send Again"}
               size="small"
-              onClick={() => void resendMessage(task.id, entry.text).catch(fail)}
+              onClick={() =>
+                void (inPlace ? rerunFrom(task.id, turn, entry.text) : resendMessage(task.id, entry.text)).catch(fail)
+              }
             />
           )}
+          {canFork && (
+            <IconButton
+              icon="branch"
+              title="Copy to a New Task From Here"
+              size="small"
+              onClick={() => void forkTask(task.id, turn + 1).catch(failed("Couldn't copy the task"))}
+            />
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** An earlier message edited where it is: sending runs the conversation again from it. */
+function MessageEditor({
+  initial,
+  later,
+  onCancel,
+  onSend,
+}: {
+  initial: string;
+  /** Turns follow it (they are dropped on send). */
+  later: boolean;
+  onCancel: () => void;
+  onSend: (text: string) => void;
+}) {
+  const tx = useTx();
+  const [text, setText] = useState(initial);
+  const send = () => {
+    if (text.trim()) onSend(text.trim());
+  };
+  return (
+    <div className={styles.message}>
+      <textarea
+        className={styles.editMessage}
+        value={text}
+        rows={Math.min(Math.max(text.split("\n").length, 2), 12)}
+        autoFocus
+        aria-label={tx("Message")}
+        onChange={(e) => setText(e.target.value)}
+        onFocus={(e) => e.currentTarget.setSelectionRange(text.length, text.length)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onCancel();
+          } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            e.preventDefault();
+            send();
+          }
+        }}
+      />
+      <div className={styles.editBar}>
+        {later && (
+          <span className={styles.muted}>
+            <T>The messages after this one are replaced. Files the agent changed stay as they are.</T>
+          </span>
+        )}
+        <span className={styles.editButtons}>
+          <Button size="small" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button size="small" variant="primary" disabled={!text.trim()} onClick={send}>
+            Send
+          </Button>
         </span>
       </div>
     </div>

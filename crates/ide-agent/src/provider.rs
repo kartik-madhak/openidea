@@ -1,66 +1,138 @@
-//! Agents and how to launch their ACP servers: the built-in ones, plus user-defined
-//! agents from `<config>/agents/<id>.toml`.
+//! Agents and how to launch them: the built-in ones, plus user-defined agents from
+//! `<config>/agents/<id>.toml` (written by hand, or by installing one from the ACP
+//! Registry, see `registry`).
 
-use serde::Deserialize;
-use std::collections::HashMap;
+use crate::AgentSource;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// The protocol an agent speaks. Native ones run behind an in-process ACP endpoint
+/// (`native`), so tasks see every agent as ACP and read features from its capabilities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Driver {
+    #[default]
+    Acp,
+    /// `codex app-server`.
+    Codex,
+    /// `claude` in stream-json mode.
+    Claude,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProviderSpec {
     pub id: String,
     pub name: String,
+    pub driver: Driver,
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     /// How to sign in when the agent reports it needs authentication.
     pub login_hint: String,
+    pub source: AgentSource,
 }
 
-/// `(id, name, command line, sign-in hint)`. npm adapters are pinned so a session's
-/// protocol does not change under the user.
-const BUILTIN: &[(&str, &str, &[&str], &str)] = &[
+/// `(id, name, driver, command line, sign-in hint)`. npm adapters are pinned so a
+/// session's protocol does not change under the user.
+const BUILTIN: &[(&str, &str, Driver, &[&str], &str)] = &[
+    ("claude", "Claude Code", Driver::Claude, &["claude"], "Run `claude` in a terminal and sign in."),
+    ("codex", "Codex", Driver::Codex, &["codex", "app-server"], "Run `codex login` in a terminal."),
     (
-        "claude",
-        "Claude Code",
+        "claude-acp",
+        "Claude Code (ACP)",
+        Driver::Acp,
         &["npx", "-y", "@agentclientprotocol/claude-agent-acp@0.97.0"],
         "Run `claude` in a terminal and sign in.",
     ),
-    ("codex", "Codex", &["npx", "-y", "@agentclientprotocol/codex-acp@2.3.0"], "Run `codex login` in a terminal."),
-    ("gemini", "Gemini CLI", &["gemini", "--experimental-acp"], "Run `gemini` in a terminal and sign in."),
-    ("copilot", "GitHub Copilot", &["copilot", "--acp"], "Run `copilot` in a terminal and sign in."),
-    ("cursor", "Cursor", &["cursor-agent", "acp"], "Run `cursor-agent login` in a terminal."),
-    ("opencode", "OpenCode", &["opencode", "acp"], "Run `opencode auth login` in a terminal."),
-    ("qwen", "Qwen Code", &["qwen", "--experimental-acp"], "Run `qwen` in a terminal and sign in."),
-    ("kimi", "Kimi CLI", &["kimi", "acp"], "Run `kimi` in a terminal and sign in."),
-    ("goose", "Goose", &["goose", "acp"], "Run `goose configure` in a terminal."),
-    ("auggie", "Auggie", &["auggie", "--acp"], "Run `auggie login` in a terminal."),
-    ("kiro", "Kiro", &["kiro-cli", "acp"], "Run `kiro-cli login` in a terminal."),
-    ("vibe", "Mistral Vibe", &["vibe-acp"], "Run `vibe` in a terminal and sign in."),
+    (
+        "codex-acp",
+        "Codex (ACP)",
+        Driver::Acp,
+        &["npx", "-y", "@agentclientprotocol/codex-acp@2.3.0"],
+        "Run `codex login` in a terminal.",
+    ),
+    ("gemini", "Gemini CLI", Driver::Acp, &["gemini", "--experimental-acp"], "Run `gemini` in a terminal and sign in."),
+    ("copilot", "GitHub Copilot", Driver::Acp, &["copilot", "--acp"], "Run `copilot` in a terminal and sign in."),
+    ("cursor", "Cursor", Driver::Acp, &["cursor-agent", "acp"], "Run `cursor-agent login` in a terminal."),
+    ("opencode", "OpenCode", Driver::Acp, &["opencode", "acp"], "Run `opencode auth login` in a terminal."),
+    ("qwen", "Qwen Code", Driver::Acp, &["qwen", "--experimental-acp"], "Run `qwen` in a terminal and sign in."),
+    ("kimi", "Kimi CLI", Driver::Acp, &["kimi", "acp"], "Run `kimi` in a terminal and sign in."),
+    ("goose", "Goose", Driver::Acp, &["goose", "acp"], "Run `goose configure` in a terminal."),
+    ("auggie", "Auggie", Driver::Acp, &["auggie", "--acp"], "Run `auggie login` in a terminal."),
+    ("kiro", "Kiro", Driver::Acp, &["kiro-cli", "acp"], "Run `kiro-cli login` in a terminal."),
+    ("vibe", "Mistral Vibe", Driver::Acp, &["vibe-acp"], "Run `vibe` in a terminal and sign in."),
 ];
 
 fn builtins() -> Vec<ProviderSpec> {
     BUILTIN
         .iter()
-        .map(|(id, name, cmd, hint)| ProviderSpec {
+        .map(|(id, name, driver, cmd, hint)| ProviderSpec {
             id: (*id).into(),
             name: (*name).into(),
+            driver: *driver,
             command: cmd[0].into(),
             args: cmd[1..].iter().map(|a| (*a).to_owned()).collect(),
             env: Vec::new(),
             login_hint: (*hint).into(),
+            source: AgentSource::Builtin,
         })
         .collect()
 }
 
-#[derive(Deserialize)]
+/// Whether `id` names a built-in agent.
+pub(crate) fn is_builtin(id: &str) -> bool {
+    BUILTIN.iter().any(|b| b.0 == id)
+}
+
+/// An agent file, `<config>/agents/<id>.toml`.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CustomAgent {
-    name: Option<String>,
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
+pub(crate) struct CustomAgent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Driver::is_acp")]
+    pub driver: Driver,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Set when the agent was installed from the ACP Registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RegistryRef {
+    pub id: String,
+    pub version: String,
+}
+
+impl Driver {
+    fn is_acp(&self) -> bool {
+        *self == Driver::Acp
+    }
+}
+
+impl CustomAgent {
+    pub(crate) fn read(path: &Path) -> Result<Self, String> {
+        std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| toml::from_str::<CustomAgent>(&t).map_err(|e| e.to_string()))
+    }
+
+    /// Writes the file atomically (a reader never sees half of it).
+    pub(crate) fn write(&self, path: &Path) -> std::io::Result<()> {
+        let text = toml::to_string(self).map_err(std::io::Error::other)?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)
+    }
 }
 
 /// Built-in agents, then the `*.toml` agents of `custom_dir`; a custom agent with a
@@ -78,24 +150,26 @@ pub(crate) fn load(custom_dir: Option<&Path>) -> Vec<ProviderSpec> {
     files.sort();
     for path in files {
         let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else { continue };
-        let parsed = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|t| toml::from_str::<CustomAgent>(&t).map_err(|e| e.to_string()));
-        let agent = match parsed {
+        let agent = match CustomAgent::read(&path) {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!("skipping agent {}: {e}", path.display());
                 continue;
             }
         };
-        let mut env: Vec<(String, String)> = agent.env.into_iter().collect();
-        env.sort();
+        let env: Vec<(String, String)> = agent.env.into_iter().collect();
+        let source = match agent.registry {
+            Some(r) => AgentSource::Registry { version: r.version, update: None },
+            None => AgentSource::Custom,
+        };
         let spec = ProviderSpec {
             name: agent.name.unwrap_or_else(|| id.clone()),
+            driver: agent.driver,
             command: agent.command,
             args: agent.args,
             env,
             login_hint: "Sign in with the agent's own command line first.".into(),
+            source,
             id,
         };
         match specs.iter_mut().find(|s| s.id == spec.id) {
@@ -154,5 +228,26 @@ mod tests {
         assert_eq!(specs.iter().filter(|s| s.id == "claude").count(), 1);
         assert!(!installed("/definitely/not/here"));
         assert!(installed("sh"));
+    }
+
+    #[test]
+    fn agent_files_round_trip_with_their_registry_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents").join("amp-acp.toml");
+        let agent = CustomAgent {
+            name: Some("Amp".into()),
+            driver: Driver::Acp,
+            command: "/data/agents/tools/amp-acp/0.10.0/amp-acp".into(),
+            args: vec!["acp".into()],
+            env: BTreeMap::from([("K".to_owned(), "v".to_owned())]),
+            registry: Some(RegistryRef { id: "amp-acp".into(), version: "0.10.0".into() }),
+        };
+        agent.write(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[registry]") && !text.contains("driver"), "{text}");
+        assert_eq!(CustomAgent::read(&path).unwrap(), agent);
+        let spec = load(Some(path.parent().unwrap())).into_iter().find(|s| s.id == "amp-acp").unwrap();
+        assert_eq!(spec.source, AgentSource::Registry { version: "0.10.0".into(), update: None });
+        assert!(toml::from_str::<CustomAgent>("command = \"x\"\n[registry]\nid = \"x\"\n").is_err());
     }
 }

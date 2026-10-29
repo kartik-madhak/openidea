@@ -1,10 +1,10 @@
 /** Debugger actions (ids match `keymaps/intellij-macos.ts`). */
-import { registerActions, type Action } from "@/platform/actions";
+import { executeAction, getAction, registerActions, type Action } from "@/platform/actions";
 import { call, commands, isCancelled, isTauri, nextRequestId, type RunConfig, type RunId } from "@/platform/ipc";
 import { downloadJdkActions } from "@/platform/jdk";
 import { useProject } from "@/platform/project";
 import { activeEditor } from "@/editor/api";
-import { maybeEditorService, notifications, toolWindowService } from "@/workbench/contributions";
+import { maybeEditorService, notifications, showStatusInfo, toolWindowService } from "@/workbench/contributions";
 import { canPlaceBreakpoint } from "./breakpoints/languages";
 import {
   removeAllBreakpoints,
@@ -35,6 +35,7 @@ import {
   type DebugSession,
 } from "./state";
 import { focusedDebugView } from "./ui/focusedView";
+import { browseFocusedConsoleHistory } from "./ui/expressionHistory";
 import { expressionAt, valueHint } from "./editor/valueTooltip";
 import { showHint } from "@/editor/lsp/hint";
 import { pausedLineTargets, startInlineSmartStep } from "./editor/smartStep";
@@ -71,6 +72,12 @@ function pausedTarget(): { s: DebugSession; thread: number } | null {
   if (!s || s.status !== "paused") return null;
   const thread = s.selectedThread ?? s.stoppedThread ?? s.threads[0]?.id;
   return thread == null ? null : { s, thread };
+}
+
+/** Run to Cursor at `line` (0-based) of `path` in the paused session. */
+export function runToLine(path: string, line: number) {
+  const t = pausedTarget();
+  if (t) void report("Run to Cursor failed", call(commands.debugRunTo(t.s.id, t.thread, path, line, false)));
 }
 
 function notSupported(what: string, s: DebugSession) {
@@ -235,6 +242,11 @@ async function startConfig(arg: unknown) {
       return;
     }
     config = configs[0]!;
+    // Through Run's debug flow: Maven / Gradle / scripts start the JVM with a JDWP agent there.
+    if (getAction("run.debugConfig")) {
+      await executeAction("run.debugConfig", config);
+      return;
+    }
   }
   if (isRemoteConfig(config)) {
     await startRemote(config, root);
@@ -609,6 +621,16 @@ export function registerDebugActions(): () => void {
       category: "Debug",
       when: "debugSessionActive",
       run: () => openEvaluateDialog(evaluateSeed()),
+    },
+    {
+      id: "debug.browseConsoleHistory",
+      title: "Browse Console History",
+      category: "Debug",
+      keywords: ["history", "previous expressions", "repl"],
+      when: "debugSessionActive",
+      run: () => {
+        if (!browseFocusedConsoleHistory()) showStatusInfo(tx("Focus the debug console input first"));
+      },
     },
     {
       // ⌥⌘F8: the selection (or expression at the caret) evaluated in a value hint, no dialog.

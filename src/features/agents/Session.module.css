@@ -182,6 +182,33 @@
   overflow-wrap: anywhere;
 }
 
+.editMessage {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  resize: vertical;
+  font: inherit;
+  color: var(--fg-strong);
+  background: var(--bg-input);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-control);
+  outline: none;
+}
+
+.editBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: var(--fs-small);
+}
+
+.editButtons {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
 .markdown {
   line-height: 1.55;
   overflow-wrap: anywhere;
@@ -408,6 +435,10 @@
   align-items: center;
   gap: 8px;
   color: var(--fg-muted);
+}
+
+.retrying {
+  color: var(--warning);
 }
 
 .composerArea {

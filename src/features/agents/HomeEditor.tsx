@@ -1,6 +1,7 @@
 /** New Task page: one prompt box with the agent and its settings; where it works under it. */
 import { useEffect, useState } from "react";
-import type { Branch } from "@/bindings";
+import type { AgentProbe, Branch } from "@/bindings";
+import { executeAction } from "@/platform/actions";
 import { call, commands } from "@/platform/ipc";
 import { useTx, useTxTemplate } from "@/platform/i18n";
 import { useProject } from "@/platform/project";
@@ -9,7 +10,8 @@ import { Composer } from "./Composer";
 import { canSend, emptyDraft } from "./composerModel";
 import { ConfigPickers } from "./ConfigPickers";
 import { providerIcon } from "./model";
-import { HOME, NO_COMMANDS, startTask, updateDraft, useAgentCommands, useAgents } from "./store";
+import { ADD_AGENT, providerOptions as agentOptions } from "./providerOptions";
+import { HOME, NO_COMMANDS, refreshProviders, startTask, updateDraft, useAgentCommands, useAgents } from "./store";
 import styles from "./Home.module.css";
 
 export function HomeEditor() {
@@ -25,6 +27,13 @@ export function HomeEditor() {
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
 
+  // Agents installed in Settings (its own window) show up when this one is back in front.
+  useEffect(() => {
+    const refresh = () => void refreshProviders();
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
+
   useEffect(() => {
     call(commands.vcsBranches(null))
       .then((list) => {
@@ -36,15 +45,9 @@ export function HomeEditor() {
   }, []);
 
   const provider = providers.find((p) => p.id === draft.provider) ?? providers[0];
+  const probe = useProbe(provider?.installed ? provider.id : null);
   const agentCommands = useAgentCommands(provider?.id, null, provider?.commands ?? NO_COMMANDS);
-  // Installed agents first; the rest under a "Not installed" title, with the command they need.
-  const installed = providers.filter((p) => p.installed);
-  const missing = providers.filter((p) => !p.installed);
-  const providerOptions: SelectOption[] = [
-    ...installed.map((p) => ({ value: p.id, label: p.name, icon: providerIcon(p.id) })),
-    ...(missing.length ? [{ value: "__missing__", label: tx("Not installed"), disabled: true }] : []),
-    ...missing.map((p) => ({ value: p.id, label: p.name, icon: providerIcon(p.id), detail: p.command })),
-  ];
+  const providerOptions: SelectOption[] = agentOptions(providers, tx, providerIcon);
   const base = draft.base ?? current;
   const canStart = canSend(composer) && !!provider?.installed && !starting;
   const root = project?.root ?? "";
@@ -84,7 +87,9 @@ export function HomeEditor() {
                 aria-label="Agent"
                 value={provider?.id ?? null}
                 options={providerOptions}
-                onChange={(id) => updateDraft({ provider: id, config: {} })}
+                onChange={(id) =>
+                  id === ADD_AGENT ? void executeAction("agents.addAgent") : updateDraft({ provider: id, config: {} })
+                }
               />
               <ConfigPickers config={provider?.config ?? []} values={draft.config} onChange={setOption} />
             </>
@@ -133,6 +138,13 @@ export function HomeEditor() {
             </>
           )}
         </div>
+        {probe && (
+          <p className={probe.error ? styles.warning : styles.note}>
+            {probe.error
+              ? txTemplate(`${provider?.name ?? probe.provider} didn't start: ${probe.error}`)
+              : [probe.name, probe.version, probe.protocol].filter(Boolean).join(" · ")}
+          </p>
+        )}
         {(error || (provider && !provider.installed) || (provider && !provider.config.length)) && (
           <p
             className={error || !provider?.installed ? styles.warning : styles.note}
@@ -149,4 +161,20 @@ export function HomeEditor() {
       </div>
     </div>
   );
+}
+
+/** What the agent reports about itself when it starts (no session is opened), once per agent. */
+function useProbe(provider: string | null): AgentProbe | null {
+  const [probe, setProbe] = useState<AgentProbe | null>(null);
+  useEffect(() => {
+    if (!provider) return;
+    let live = true;
+    call(commands.agentProbe(provider, false))
+      .then((p) => live && setProbe(p))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [provider]);
+  return probe?.provider === provider ? probe : null;
 }

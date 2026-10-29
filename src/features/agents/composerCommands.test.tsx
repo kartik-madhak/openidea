@@ -33,6 +33,7 @@ const claude: AgentProvider = {
   command: "npx",
   installed: true,
   config: [],
+  source: { kind: "builtin" },
   // Offered by the agent's last session in this project.
   commands: [command("compact", "Free up context")],
 };

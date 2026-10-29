@@ -5,20 +5,34 @@
  */
 import { registerActions } from "@/platform/actions";
 import { useProject } from "@/platform/project";
+import { executeAction } from "@/platform/actions";
 import { lazyComponent } from "@/ui";
 import { isVirtualUri } from "@/platform/virtualDocs";
 import {
   registerEditorKind,
   registerMenuGroup,
+  registerSettingsPage,
   registerStatusItem,
   registerToolWindow,
   toolWindowService,
 } from "@/workbench/contributions";
 import { AgentsStatus } from "./AgentsStatus";
-import { HOME_KIND, SESSION_KIND, TOOL_WINDOW } from "./model";
+import { HOME_KIND, REGISTRY_PAGE, SESSION_KIND, TOOL_WINDOW } from "./model";
 import { sendPaths, sendSelection } from "./references";
 import { focusedSession } from "./sessionFocus";
 import { connect, disconnect, openHome, useAgents } from "./store";
+
+/** Settings › Tools › Agents (also used by the Settings window). */
+export function activateSettingsPages(): () => void {
+  return registerSettingsPage({
+    id: REGISTRY_PAGE,
+    title: "Agents",
+    group: "Tools",
+    order: 500,
+    keywords: ["agent", "acp", "registry", "install", "update", "coding agent"],
+    component: lazyComponent(() => import("./AgentRegistryPage").then((m) => m.AgentRegistryPage)),
+  });
+}
 
 export function activate(): () => void {
   const sync = (root: string | null | undefined) => {
@@ -27,6 +41,7 @@ export function activate(): () => void {
   };
   sync(useProject.getState().project?.root);
   const disposers = [
+    activateSettingsPages(),
     useProject.subscribe((s, prev) => {
       if (s.project?.root !== prev.project?.root) sync(s.project?.root);
     }),
@@ -34,7 +49,7 @@ export function activate(): () => void {
       id: TOOL_WINDOW,
       title: "Agents",
       icon: "toolwindow-agents",
-      anchor: "left",
+      anchor: "right",
       order: 0.5,
       component: lazyComponent(() => import("./AgentsView").then((m) => m.AgentsView)),
       headerActions: lazyComponent(() => import("./AgentsView").then((m) => m.AgentsHeaderActions)),
@@ -89,6 +104,15 @@ export function activate(): () => void {
         when: "projectOpen",
         keywords: ["agent", "claude", "codex", "gemini", "ai"],
         run: ({ arg }) => openHome(typeof arg === "string" ? arg : undefined),
+      },
+      {
+        id: "agents.addAgent",
+        title: "More Agents…",
+        description: "Opens Settings › Tools › Agents: installs, updates or removes agents from the ACP Registry.",
+        category: "Agents",
+        icon: "plugin",
+        keywords: ["agent", "acp", "registry", "install", "update"],
+        run: () => void executeAction("file.settings", REGISTRY_PAGE),
       },
       {
         id: "agents.sendToAgent",

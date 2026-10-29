@@ -146,6 +146,8 @@ export interface ServiceTreeItem {
   detail?: string;
   /** Greyed label (stopped, not running). */
   dim?: boolean;
+  /** Expanded the first time the node appears. */
+  expanded?: boolean;
   /** Undefined for leaves. */
   children?: ServiceTreeItem[];
 }
@@ -884,6 +886,8 @@ export interface RunConfigTypeField {
    */
   control?: "text" | "textarea" | "select" | "checkbox" | "output";
   mono?: boolean;
+  /** Visible lines of a `textarea` (default 4). */
+  rows?: number;
   placeholder?: string;
   options?: ReadonlyArray<{ value: string; label: string }>;
   /** Values offered while typing (e.g. the scripts of detected configurations). */

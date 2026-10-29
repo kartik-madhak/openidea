@@ -443,8 +443,13 @@ mod tests {
 
     #[test]
     fn end_turn_records_when_the_last_message_was_answered() {
-        let user =
-            |sent: f64| AgentEntry::User { text: "q".into(), attachments: vec![], sent_ms: Some(sent), done_ms: None };
+        let user = |sent: f64| AgentEntry::User {
+            text: "q".into(),
+            attachments: vec![],
+            sent_ms: Some(sent),
+            done_ms: None,
+            steered: false,
+        };
         let mut t = Timeline::default();
         t.push(user(1.0));
         t.push(AgentEntry::Agent { text: "a".into() });

@@ -1,14 +1,7 @@
 /** Editor actions (ids from keymaps/intellij-macos.ts). */
 import { EditorSelection, type EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import {
-  addCursorAbove,
-  addCursorBelow,
-  indentSelection,
-  moveLineDown,
-  moveLineUp,
-  toggleBlockComment,
-} from "@codemirror/commands";
+import { indentSelection, moveLineDown, moveLineUp, toggleBlockComment } from "@codemirror/commands";
 import { foldEffect, syntaxTree, toggleFold } from "@codemirror/language";
 import { acceptCompletion, completionStatus } from "@codemirror/autocomplete";
 import { executeAction, registerActions, type Action } from "@/platform/actions";
@@ -52,6 +45,7 @@ import {
 } from "./cm/folding";
 import { reverseLines, sortLines } from "./cm/lines";
 import { customRegions } from "./cm/regions";
+import { enclosingHeaders } from "./cm/stickyScroll";
 import { moveElementLeft, moveElementRight } from "./cm/moveElement";
 import { caretAnchor, openPopup } from "@/editor/lsp/popupStore";
 import {
@@ -65,6 +59,7 @@ import {
 } from "./cm/caretCommands";
 import { isOverwrite, toggleOverwrite } from "./cm/overwrite";
 import { isColumnMode, toggleColumnMode } from "./cm/columnMode";
+import { cloneCaretAbove, cloneCaretBelow } from "./cm/verticalMotion";
 import { pasteAsPlainText, pasteFromHistory, unwrapAtCaret } from "./extras";
 import { cyclicExpandWord } from "./wordCompletion";
 import { qualifiedReference } from "./copyReference";
@@ -328,6 +323,18 @@ function completeCurrentStatement(view: EditorView, slot: EditorSlot) {
   });
 }
 
+/**
+ * View › Context Info (⌃⇧Q / Alt+Q): the declaration lines around the caret
+ * (class, method, block headers), most useful when they are scrolled away.
+ */
+function showContextInfo(view: EditorView) {
+  const state = view.state;
+  const line = state.doc.lineAt(state.selection.main.head).number;
+  const headers = enclosingHeaders(state, line);
+  const text = headers.map((n) => state.doc.line(n).text.trimEnd()).join("\n");
+  void executeAction("editor.showHint", { text: text || "No context information here" });
+}
+
 /** Navigate › Custom Folding (⌥⌘.): the file's custom regions; picking one moves the caret to it. */
 function showCustomRegions(view: EditorView) {
   const regions = customRegions(view.state.doc);
@@ -574,6 +581,10 @@ export function registerEditorActions(): () => void {
         category: "Editor Actions",
       },
     ),
+    text("editor.contextInfo", "Context Info", (v) => showContextInfo(v), {
+      category: "View",
+      keywords: ["enclosing method", "enclosing class", "where am I"],
+    }),
     text("navigate.customRegion", "Custom Folding…", (v) => showCustomRegions(v), {
       category: "Navigate",
       keywords: ["region", "editor-fold", "go to region"],
@@ -592,8 +603,8 @@ export function registerEditorActions(): () => void {
     text("code.autoIndentLines", "Auto-Indent Lines", (v) => !v.state.readOnly && indentSelection(v), {
       keywords: ["reindent", "fix indentation"],
     }),
-    text("editor.cloneCaretAbove", "Clone Caret Above", (v) => addCursorAbove(v), { category: "Editor Actions" }),
-    text("editor.cloneCaretBelow", "Clone Caret Below", (v) => addCursorBelow(v), { category: "Editor Actions" }),
+    text("editor.cloneCaretAbove", "Clone Caret Above", (v) => cloneCaretAbove(v), { category: "Editor Actions" }),
+    text("editor.cloneCaretBelow", "Clone Caret Below", (v) => cloneCaretBelow(v), { category: "Editor Actions" }),
     text("editor.matchBrace", "Move Caret to Matching Brace", (v) => cursorMatchBrace(v), {
       category: "Editor Actions",
       // ⌃M is Show Commit Message History in the commit window.
@@ -765,6 +776,8 @@ export function registerEditorActions(): () => void {
       category: "Navigate",
       keywords: ["breadcrumbs"],
       when: "projectOpen",
+      // ⌘↑ / ⌘↓ inside a popup (Search Everywhere's previous / next group) stay with it.
+      keyWhen: "!popupOpen",
       run: () => {
         if (activeSlot()) return openNavBarPopup();
         // No editor: the status bar breadcrumbs (StatusItems › Breadcrumbs) take focus.
@@ -884,6 +897,30 @@ export function registerEditorActions(): () => void {
       category: "Window",
       when: "editorSplit",
       run: () => ctrl.unsplit(useTabs.getState().activePane),
+    },
+    {
+      id: "editor.unsplitAll",
+      title: "Unsplit All",
+      category: "Window",
+      when: "editorSplit",
+      run: () => ctrl.unsplitAll(useTabs.getState().activePane),
+    },
+    {
+      id: "editor.changeSplitOrientation",
+      title: "Change Splitter Orientation",
+      category: "Window",
+      when: "editorSplit",
+      run: () => ctrl.changeSplitOrientation(useTabs.getState().activePane),
+    },
+    {
+      id: "editor.openInOppositeGroup",
+      title: "Open in Opposite Group",
+      category: "Window",
+      when: TABS_WHEN,
+      run: () => {
+        const t = activePaneTab();
+        if (t) ctrl.openInOpposite(t.paneId, t.tabId);
+      },
     },
     {
       id: "editor.copyPath",

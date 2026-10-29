@@ -17,7 +17,8 @@ export function applyChunk(mv: MergeView, index: number, source: "a" | "b") {
   dst.dispatch({ changes: transferChunk(chunk, source, src.state.doc, dst.state.doc), userEvent: "revert" });
 }
 
-function arrowButton(dir: "a-to-b" | "b-to-a", run: (chunkIndex: number) => void): HTMLButtonElement {
+/** A ">>" / "<<" button; the chunk index comes from the nearest `data-chunk` (itself included). */
+export function arrowButton(dir: "a-to-b" | "b-to-a", run: (chunkIndex: number) => void): HTMLButtonElement {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = `cm-diffArrow cm-diffArrow-${dir}`;
@@ -84,7 +85,7 @@ class RevertWidget extends WidgetType {
   }
 }
 
-function chunkAt(chunks: readonly Chunk[], side: "a" | "b", pos: number, docLength: number): number {
+export function chunkAt(chunks: readonly Chunk[], side: "a" | "b", pos: number, docLength: number): number {
   return chunks.findIndex((c) => {
     const [from, to] = side === "a" ? [c.fromA, c.toA] : [c.fromB, c.toB];
     return from === to ? pos === from : pos >= from && pos < Math.max(to, from + 1) && pos <= docLength;

@@ -210,6 +210,12 @@ pub trait Handler: Send + Sync + 'static {
     fn on_notification(&self, method: &str, params: Value);
     /// Respond to a server→client request (e.g. `workspace/configuration`).
     fn on_request(&self, method: &str, params: Value) -> Result<Value, (i64, String)>;
+
+    /// [`on_request`](Self::on_request) for handlers whose errors carry `data`. This is the
+    /// one the connection calls.
+    fn on_request_with_data(&self, method: &str, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+        self.on_request(method, params).map_err(|(code, message)| (code, message, None))
+    }
 }
 
 /// A [`Handler`] that ignores notifications and rejects requests.
@@ -706,11 +712,15 @@ enum Incoming {
 
 async fn handle_request(inner: Arc<Inner>, handler: Arc<dyn Handler>, id: Value, method: String, params: Value) {
     let m = method.clone();
-    let result = tokio::task::spawn_blocking(move || handler.on_request(&m, params)).await;
+    let result = tokio::task::spawn_blocking(move || handler.on_request_with_data(&m, params)).await;
     let reply = match result {
         Ok(Ok(result)) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Ok(Err((code, message))) => {
-            json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+        Ok(Err((code, message, data))) => {
+            let mut error = json!({ "code": code, "message": message });
+            if let Some(data) = data {
+                error["data"] = data;
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "error": error })
         }
         Err(_) => json!({
             "jsonrpc": "2.0", "id": id,

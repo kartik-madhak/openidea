@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use ide_core::settings::Settings;
-use ide_core::{EventSink, IdeError, IdeResult, RequestId};
+use ide_core::{EventSink, IdeError, IdeResult, RequestId, TaskId};
 use ide_language::LanguageInfo;
 use ide_workspace::RecentProject;
 use ide_workspace::settings::SettingsScope;
@@ -128,7 +128,7 @@ pub fn settings_get(window: Window, state: State<'_, AppState>) -> Settings {
 #[tauri::command]
 #[specta::specta]
 pub fn settings_get_global(state: State<'_, AppState>) -> Settings {
-    state.global_settings.effective()
+    state.host.with_proxy_password(state.global_settings.effective())
 }
 
 /// `value` is JSON text, e.g. `14` or `"dark"`. Every window (for a project
@@ -196,11 +196,9 @@ pub async fn settings_import(window: Window, state: State<'_, AppState>, path: P
         tauri::async_runtime::spawn(async move { lsp.reconfigure().await });
     }
     crate::commands::ssh::apply_ssh_settings(&state);
+    state.host.apply_proxy();
     state.sink.emit(ide_core::IdeEvent::SettingsChanged { key: String::new() });
-    let settings = match state.project(window.label()) {
-        Ok(p) => p.settings.effective(),
-        Err(_) => state.global_settings.effective(),
-    };
+    let settings = ide_host::ops::project::settings(&state.host, window.label());
     Ok(SettingsImport { settings, storage })
 }
 
@@ -223,6 +221,14 @@ pub fn project_current(window: Window, state: State<'_, AppState>) -> Option<Pro
 #[specta::specta]
 pub fn cancel_request(state: State<'_, AppState>, id: RequestId) {
     state.cancel_request(id);
+}
+
+/// Stops a background task the backend reported with `cancellable` set; false when it
+/// has ended or can't be cancelled.
+#[tauri::command]
+#[specta::specta]
+pub fn cancel_task(id: TaskId) -> bool {
+    ide_core::task::cancel(id)
 }
 
 #[derive(Serialize, Deserialize, Type)]

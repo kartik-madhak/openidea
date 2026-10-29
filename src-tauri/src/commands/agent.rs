@@ -1,11 +1,14 @@
 //! IPC commands of `ide_host::ops::agent` (the shared implementation).
 
 use crate::state::AppState;
+use ide_agent::registry::AgentRegistry;
 use ide_agent::{
-    AgentChange, AgentCommand, AgentEntry, AgentEvent, AgentPrompt, AgentProvider, AgentQueued, AgentTask, NewAgentTask,
+    AgentChange, AgentCommand, AgentEntry, AgentEvent, AgentProbe, AgentPrompt, AgentProvider, AgentQueued, AgentTask,
+    NewAgentTask,
 };
-use ide_core::{IdeResult, IpcPath};
+use ide_core::{IdeResult, IpcPath, RequestId};
 use ide_host::ops::agent;
+use ide_tools::InstallEvent;
 use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::{State, Window};
@@ -31,6 +34,39 @@ pub fn agent_subscribe(
 #[specta::specta]
 pub fn agent_providers(window: Window, state: State<'_, AppState>) -> IdeResult<Vec<AgentProvider>> {
     agent::providers(&state.host, window.label())
+}
+
+/// Agents of the ACP Registry this machine can run, with what is installed; the list
+/// saved earlier when the registry is unreachable. Cancel with `cancel_request(request)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn agent_registry_list(
+    window: Window,
+    state: State<'_, AppState>,
+    request: RequestId,
+) -> IdeResult<AgentRegistry> {
+    agent::registry_list(&state.host, window.label(), request).await
+}
+
+/// Installs the registry's current version of agent `id` (also to update it), streaming
+/// progress through `on_event`. Cancel with `cancel_request(request)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn agent_registry_install(
+    window: Window,
+    state: State<'_, AppState>,
+    id: String,
+    request: RequestId,
+    on_event: Channel<InstallEvent>,
+) -> IdeResult<()> {
+    agent::registry_install(&state.host, window.label(), id, request, crate::commands::sender(on_event)).await
+}
+
+/// Removes a registry agent: its agent file and installed files.
+#[tauri::command]
+#[specta::specta]
+pub async fn agent_registry_remove(window: Window, state: State<'_, AppState>, id: String) -> IdeResult<()> {
+    agent::registry_remove(&state.host, window.label(), id).await
 }
 
 /// Slash commands to complete for `provider` in `task`'s directory, or in the project
@@ -112,6 +148,43 @@ pub async fn agent_set_config(
     value: String,
 ) -> IdeResult<()> {
     agent::set_config(&state.host, window.label(), task, option, value).await
+}
+
+/// Copies the task's conversation into a new task, up to its first `turns` turns (all when `None`).
+#[tauri::command]
+#[specta::specta]
+pub async fn agent_fork(
+    window: Window,
+    state: State<'_, AppState>,
+    task: String,
+    turns: Option<u32>,
+) -> IdeResult<AgentTask> {
+    agent::fork(&state.host, window.label(), task, turns).await
+}
+
+/// Drops the task's turns after its first `turns`; returns the message of the first dropped one.
+#[tauri::command]
+#[specta::specta]
+pub async fn agent_rollback(
+    window: Window,
+    state: State<'_, AppState>,
+    task: String,
+    turns: u32,
+) -> IdeResult<Option<AgentPrompt>> {
+    agent::rollback(&state.host, window.label(), task, turns).await
+}
+
+/// What the agent reports about itself when it starts (no session: no MCP servers, hooks
+/// or sign-in run). Remembered until `refresh`.
+#[tauri::command]
+#[specta::specta]
+pub async fn agent_probe(
+    window: Window,
+    state: State<'_, AppState>,
+    provider: String,
+    refresh: bool,
+) -> IdeResult<AgentProbe> {
+    agent::probe(&state.host, window.label(), provider, refresh).await
 }
 
 /// Stops the task's current turn, or with `subagent` only that subagent's work.

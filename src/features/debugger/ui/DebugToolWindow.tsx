@@ -39,6 +39,11 @@ import {
   type DebugSession,
 } from "../state";
 import { VariablesView, type VarRoot } from "./VariablesView";
+import { pushHistory, readHistory, setConsoleHistoryBrowser } from "./expressionHistory";
+import { sortVariables } from "../values";
+import { workflowSettings } from "@/platform/workflowSettings";
+import { spanStyle } from "@/ui/ansi";
+import ansi from "@/ui/ansi.module.css";
 import styles from "./DebugToolWindow.module.css";
 import { tx } from "@/platform/i18n";
 
@@ -388,7 +393,10 @@ function VariablesPane({ session }: { session: DebugSession }) {
       try {
         scopes = await call(commands.debugScopes(session.id, frame));
         const first = scopes.find((s) => !s.expensive);
-        if (first) locals = await call(commands.debugVariables(session.id, first.variablesReference));
+        if (first) {
+          const vars = await call(commands.debugVariables(session.id, first.variablesReference));
+          locals = workflowSettings().debugger.sortValues ? sortVariables(vars) : vars;
+        }
       } catch {
         // Frame went away (resumed).
       }
@@ -542,8 +550,9 @@ function ConsoleView({ session }: { session: DebugSession }) {
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [input, setInput] = useState("");
-  const history = useRef<string[]>([]);
+  const history = useRef<string[]>(readHistory("console"));
   const historyPos = useRef(-1);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const el = scroller.current;
@@ -553,7 +562,8 @@ function ConsoleView({ session }: { session: DebugSession }) {
   const submit = async () => {
     const e = input.trim();
     if (!e) return;
-    history.current = [e, ...history.current.filter((h) => h !== e)].slice(0, 100);
+    pushHistory("console", e);
+    history.current = readHistory("console");
     historyPos.current = -1;
     setInput("");
     appendConsole(session.id, "input", `> ${e}\n`);
@@ -563,6 +573,24 @@ function ConsoleView({ session }: { session: DebugSession }) {
     } catch (err) {
       appendConsole(session.id, "stderr", `${err instanceof Error ? err.message : String(err)}\n`);
     }
+  };
+
+  /** IDEA's Browse History popup: the expressions typed before, most recent first. */
+  const browseHistory = () => {
+    const el = inputRef.current;
+    const r = el?.getBoundingClientRect();
+    const items: MenuItem[] = history.current.length
+      ? history.current.slice(0, 30).map((h, i) => ({
+          id: String(i),
+          label: h.length > 120 ? `${h.slice(0, 120)}…` : h,
+          run: () => {
+            setInput(h);
+            historyPos.current = i;
+            el?.focus();
+          },
+        }))
+      : [{ id: "none", label: "No history", disabled: true }];
+    showContextMenu({ x: r?.left ?? 120, y: (r?.top ?? 200) - 4 }, items);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -583,7 +611,7 @@ function ConsoleView({ session }: { session: DebugSession }) {
     <div className={styles.console}>
       <div
         ref={scroller}
-        className={styles.consoleOutput}
+        className={clsx(styles.consoleOutput, ansi.palette)}
         onScroll={(e) => {
           const el = e.currentTarget;
           stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
@@ -598,7 +626,11 @@ function ConsoleView({ session }: { session: DebugSession }) {
       >
         {(lines ?? []).map((l) => (
           <span key={l.id} className={clsx(styles.out, styles[`cat-${l.category}`])}>
-            {l.text}
+            {l.spans.map((sp, i) => (
+              <span key={i} style={spanStyle(sp)}>
+                {sp.text}
+              </span>
+            ))}
           </span>
         ))}
       </div>
@@ -607,7 +639,10 @@ function ConsoleView({ session }: { session: DebugSession }) {
           ›
         </span>
         <input
+          ref={inputRef}
           className={styles.evalInput}
+          onFocus={() => setConsoleHistoryBrowser(browseHistory)}
+          onBlur={() => setConsoleHistoryBrowser(null)}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}

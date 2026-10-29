@@ -15,7 +15,24 @@ pub enum AgentStatus {
     /// The turn ended; the result can be reviewed or the conversation continued.
     Ready,
     Failed,
+    /// The account's usage limit was reached; the conversation can go on once it resets.
+    Limited,
     Archived,
+}
+
+/// What a task's agent can do beyond a plain conversation, as it reported when its
+/// session started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentCapabilities {
+    /// Images in messages.
+    pub images: bool,
+    /// The conversation can be copied into a new task (`session/fork`).
+    pub fork: bool,
+    /// Its latest turns can be dropped.
+    pub rollback: bool,
+    /// A message can join the running turn instead of waiting for it.
+    pub steer: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -59,6 +76,26 @@ pub struct AgentTask {
     pub usage: Option<AgentUsage>,
     /// Messages waiting for the current turn to end, oldest first.
     pub queue: Vec<AgentQueued>,
+    #[serde(default)]
+    pub capabilities: AgentCapabilities,
+    /// When a [`AgentStatus::Limited`] task's limit resets (ms since the epoch), if the agent said.
+    #[serde(default)]
+    pub resets_ms: Option<f64>,
+    /// The agent is retrying a failed API request (connection lost, overloaded…); cleared
+    /// by its next output or any status change.
+    #[serde(default)]
+    pub retry: Option<AgentRetry>,
+}
+
+/// An API request the agent is about to retry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRetry {
+    pub attempt: u32,
+    pub max_retries: Option<u32>,
+    /// When the next attempt starts (ms since the epoch).
+    pub retry_at_ms: f64,
+    pub error: Option<String>,
 }
 
 /// One value of a select-type session setting.
@@ -209,6 +246,9 @@ pub enum AgentEntry {
         /// When the turn it started ended; `None` while it runs or when it was cut off.
         #[serde(default)]
         done_ms: Option<f64>,
+        /// Sent into a running turn rather than starting one.
+        #[serde(default)]
+        steered: bool,
     },
     Agent {
         text: String,
@@ -282,6 +322,40 @@ pub struct AgentProvider {
     pub config: Vec<AgentConfigOption>,
     /// Slash commands it offered last time.
     pub commands: Vec<AgentCommand>,
+    pub source: AgentSource,
+}
+
+/// Where an agent comes from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AgentSource {
+    Builtin,
+    /// Defined by the user in `<config>/agents/<id>.toml`.
+    Custom,
+    /// Installed from the ACP Registry.
+    Registry {
+        version: String,
+        /// A newer version the registry offers.
+        update: Option<String>,
+    },
+}
+
+/// What an agent says about itself when it starts (`initialize` only: no session, so no
+/// MCP servers, hooks or sign-in run).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProbe {
+    pub provider: String,
+    /// The agent's own name and version, when it reports them.
+    pub name: Option<String>,
+    pub version: Option<String>,
+    /// How it is driven: `ACP v1`, `ACP v2` or `native`.
+    pub protocol: String,
+    pub capabilities: AgentCapabilities,
+    /// Ways to sign in it offers.
+    pub auth_methods: Vec<String>,
+    /// Why it could not be started.
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -317,6 +391,11 @@ pub enum AgentEvent {
     },
     Removed {
         id: String,
+    },
+    /// The task's conversation was cut to its first `length` entries (turns rolled back).
+    Truncated {
+        task: String,
+        length: u32,
     },
     /// Entry `index` of `task` (of its subagent `subagent`) was added or replaced.
     Entry {

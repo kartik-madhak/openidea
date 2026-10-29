@@ -5,6 +5,8 @@ export const SESSION_KIND = "agent-session";
 export const HOME_KIND = "agent-home";
 export const HOME_KEY = "agent:new";
 export const TOOL_WINDOW = "agents";
+/** Settings › Tools › Agents: the ACP Registry. */
+export const REGISTRY_PAGE = "tools.agents";
 
 export const sessionKey = (task: string) => `agent:${task}`;
 
@@ -57,7 +59,7 @@ export const providerIcon = (provider: string) =>
   PROVIDER_ICONS.has(provider) ? `agent-${provider}` : "toolwindow-agents";
 
 export interface TaskGroup {
-  status: "needsInput" | "failed" | "running" | "ready" | "archived";
+  status: "needsInput" | "failed" | "limited" | "running" | "ready" | "archived";
   label: string;
   tasks: AgentTask[];
 }
@@ -66,6 +68,7 @@ export interface TaskGroup {
 const GROUPS: Array<[TaskGroup["status"], string, AgentStatus[]]> = [
   ["needsInput", "Needs Input", ["needsInput"]],
   ["failed", "Failed", ["failed"]],
+  ["limited", "Usage Limit", ["limited"]],
   ["running", "Running", ["running", "starting"]],
   ["ready", "Ready to Review", ["ready"]],
   ["archived", "Archived", ["archived"]],
@@ -105,9 +108,20 @@ export function statusLabel(s: AgentStatus): string {
       return "Ready";
     case "failed":
       return "Failed";
+    case "limited":
+      return "Usage limit";
     case "archived":
       return "Archived";
   }
+}
+
+/** Index of each turn-starting message in `entries`: its turn's number (messages steered into a running turn don't start one). */
+export function turnNumbers(entries: AgentEntry[]): Map<number, number> {
+  const out = new Map<number, number>();
+  entries.forEach((e, i) => {
+    if (e.type === "user" && !e.steered) out.set(i, out.size);
+  });
+  return out;
 }
 
 /** "3m", "2h", "5d" since `ms`. */
@@ -130,6 +144,6 @@ export function attentionChange(
   if (next === "needsInput") return "input";
   if (!isBusy(prev)) return null;
   if (next === "ready") return "finished";
-  if (next === "failed") return "failed";
+  if (next === "failed" || next === "limited") return "failed";
   return null;
 }

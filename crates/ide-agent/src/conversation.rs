@@ -156,6 +156,19 @@ impl Conversation {
         changed.map(|i| (parent, i))
     }
 
+    /// Keeps the task's first `len` entries, and the subagents still shown in them.
+    pub fn truncate(&mut self, len: usize) {
+        let mut entries = std::mem::take(&mut self.main.entries);
+        entries.truncate(len);
+        self.main = Timeline::from_entries(entries);
+        let shown = |c: &Conversation, id: &str| {
+            c.main.entries.iter().any(|e| matches!(e, AgentEntry::Subagent { id: card, .. } if card == id))
+        };
+        let keep: Vec<bool> = self.subagents.iter().map(|s| s.parent.is_some() || shown(self, &s.id)).collect();
+        let mut keep = keep.into_iter();
+        self.subagents.retain(|_| keep.next().unwrap_or(true));
+    }
+
     /// Settles what an ended turn of the task left open. Subagents work on (in the background).
     pub fn end_turn(&mut self, done: Option<f64>) -> Vec<(Session, usize)> {
         self.main.end_turn(done).into_iter().map(|i| (None, i)).collect()

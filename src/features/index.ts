@@ -36,7 +36,7 @@ import { activate as github } from "./github";
 import { activate as httpClient } from "./http-client";
 import { activate as database } from "./database";
 import { activate as deployment } from "./deployment";
-import { activate as agents } from "./agents";
+import { activate as agents, activateSettingsPages as agentsPages } from "./agents";
 import { activate as vim, activateSettingsPages as vimPages } from "./vim";
 import { activate as ssh } from "./ssh";
 import { activate as remoteDev } from "./remote-dev";
@@ -110,6 +110,7 @@ export function activateSettingsWindowFeatures(parent: string): () => void {
     ["todo", todoPages],
     ["plugins", pluginsPages],
     ["tools", toolsPages],
+    ["agents", agentsPages],
     ["vim", vimPages],
     ["vcs", vcsPages],
   ];

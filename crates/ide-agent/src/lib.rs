@@ -7,10 +7,13 @@
 //! project's store directory and survive restarts; the agent session is reloaded on the
 //! next prompt when the agent supports `session/load`.
 
+mod acp;
 mod config;
 mod conversation;
 mod model;
+mod native;
 mod provider;
+pub mod registry;
 mod skills;
 mod timeline;
 mod worktree;
@@ -23,7 +26,7 @@ use ide_jsonrpc::{Framing, Handler, Peer, RpcError, codes};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
@@ -43,8 +46,12 @@ const STDERR_LINES: usize = 20;
 /// Updates of a session's state rather than its conversation.
 const SESSION_STATE: [&str; 5] =
     ["session_info_update", "config_option_update", "current_mode_update", "available_commands_update", "usage_update"];
+/// A native agent's own update: it is about to retry a failed API request (see [`AgentRetry`]).
+pub(crate) const RETRY_UPDATE: &str = "openidea_retry";
 /// Referenced files up to this size are embedded in the prompt (when the agent takes it).
 const MAX_EMBED: u64 = 256 * 1024;
+/// How long a probe waits for the agent to answer `initialize`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The agent tasks of one project.
 pub struct AgentManager {
@@ -80,6 +87,8 @@ struct Shared {
     sink: RwLock<Option<AgentSink>>,
     known: Mutex<HashMap<String, Known>>,
     providers: RwLock<Vec<provider::ProviderSpec>>,
+    /// Last probe of each provider.
+    probes: Mutex<HashMap<String, AgentProbe>>,
 }
 
 /// What an agent offered in its last session, for the New Task page.
@@ -161,6 +170,9 @@ struct TaskFile {
     before: BTreeMap<String, worktree::Stamp>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     subagents: Vec<SavedSubagent>,
+    /// Turns to drop from the session once it is loaded (a fork of an earlier point).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pending_rollback: u32,
 }
 
 struct TaskState {
@@ -169,6 +181,7 @@ struct TaskState {
     conversation: Conversation,
     wanted: Vec<AgentConfigChoice>,
     before: Arc<BTreeMap<String, worktree::Stamp>>,
+    pending_rollback: u32,
     /// A turn is running or about to (prompts arriving now are queued).
     busy: bool,
 }
@@ -176,10 +189,9 @@ struct TaskState {
 /// A running agent and its session.
 #[derive(Clone)]
 struct Live {
-    peer: Peer,
+    peer: acp::Conn,
     session: String,
-    /// `promptCapabilities.image`.
-    images: bool,
+    capabilities: AgentCapabilities,
     /// `promptCapabilities.embeddedContext`: referenced files are sent with their text.
     embedded: bool,
 }
@@ -198,6 +210,13 @@ struct Task {
     replaying: AtomicBool,
     /// The current turn is being cancelled to send the first queued message right away.
     send_now: AtomicBool,
+    /// The user stopped the current turn. A stop that reaches the agent before it took the
+    /// prompt can be ignored, so it is sent again once the turn shows signs of life.
+    cancel_pending: AtomicBool,
+    /// The agent reported something for the current turn.
+    turn_started: AtomicBool,
+    /// Settings already sent this session (`(option, value)`), so a refusal is not retried.
+    config_sent: Mutex<HashSet<(String, String)>>,
     dirty: Mutex<BTreeSet<(Session, usize)>>,
     flush_scheduled: AtomicBool,
     stderr: Mutex<VecDeque<String>>,
@@ -208,8 +227,12 @@ struct Task {
 impl AgentManager {
     /// Loads the project's saved tasks. Spawned work runs on `runtime`.
     pub fn new(paths: AgentPaths, runtime: tokio::runtime::Handle) -> Self {
-        let connector: Connector = Arc::new(|spec, cwd, client, on_stderr| {
-            Peer::spawn_framed(&spec.command, &spec.args, cwd, &spec.env, client, on_stderr, Framing::Lines)
+        let connector: Connector = Arc::new(|spec, cwd, client, on_stderr| match spec.driver {
+            provider::Driver::Acp => {
+                Peer::spawn_framed(&spec.command, &spec.args, cwd, &spec.env, client, on_stderr, Framing::Lines)
+            }
+            provider::Driver::Codex => native::codex::connect(spec, cwd, client, on_stderr),
+            provider::Driver::Claude => native::claude::connect(spec, cwd, client, on_stderr),
         });
         Self::with_connector(paths, runtime, connector)
     }
@@ -225,6 +248,7 @@ impl AgentManager {
             sink: RwLock::new(None),
             known: Mutex::new(known),
             providers,
+            probes: Mutex::new(HashMap::new()),
         });
         let mut tasks = HashMap::new();
         for file in std::fs::read_dir(&shared.paths.store_dir).into_iter().flatten().flatten() {
@@ -242,6 +266,7 @@ impl AgentManager {
                     if matches!(f.task.status, AgentStatus::Running | AgentStatus::NeedsInput | AgentStatus::Starting) {
                         f.task.status = AgentStatus::Ready;
                     }
+                    f.task.retry = None;
                     let task = Task::restore(f, shared.clone());
                     task.state.lock().conversation.settle(now_ms());
                     tasks.insert(task.id.clone(), task);
@@ -275,6 +300,7 @@ impl AgentManager {
                 installed: provider::installed(&p.command),
                 config: self.shared.known_config(&p.id),
                 commands: self.shared.known_commands(&p.id),
+                source: p.source.clone(),
             })
             .collect();
         *self.shared.providers.write() = specs;
@@ -293,7 +319,7 @@ impl AgentManager {
             }
             None => (provider.to_owned(), self.shared.known_commands(provider), self.shared.paths.project_root.clone()),
         };
-        if provider != "claude" {
+        if provider != "claude" && provider != "claude-acp" {
             return Ok(offered);
         }
         let home = self.shared.paths.home_dir.clone();
@@ -364,6 +390,9 @@ impl AgentManager {
             commands: self.shared.known_commands(&spec.id),
             usage: None,
             queue: Vec::new(),
+            capabilities: self.shared.probes.lock().get(&spec.id).map(|p| p.capabilities).unwrap_or_default(),
+            resets_ms: None,
+            retry: None,
         };
         let file = TaskFile {
             task: task.clone(),
@@ -372,6 +401,7 @@ impl AgentManager {
             wanted: req.config,
             before,
             subagents: Vec::new(),
+            pending_rollback: 0,
         };
         let handle = Task::restore(file, self.shared.clone());
         handle.state.lock().busy = true;
@@ -387,6 +417,14 @@ impl AgentManager {
     pub async fn prompt(&self, id: &str, prompt: AgentPrompt, now: bool) -> IdeResult<()> {
         let task = self.task(id)?;
         let prompt = clean(prompt).ok_or_else(|| IdeError::invalid("empty message"))?;
+        // An agent that takes messages mid-turn gets it right away.
+        let prompt = match now {
+            true => match task.steer(prompt).await {
+                Ok(()) => return Ok(()),
+                Err(prompt) => prompt,
+            },
+            false => prompt,
+        };
         let start = {
             let mut s = task.state.lock();
             if s.task.status == AgentStatus::Archived {
@@ -501,6 +539,172 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Copies the task's conversation into a new task in the same directory, up to its
+    /// first `turns` turns (all of them when `None`). The copy loads its own session on
+    /// its first message.
+    pub async fn fork(&self, id: &str, turns: Option<u32>) -> IdeResult<AgentTask> {
+        let source = self.task(id)?;
+        if source.state.lock().busy {
+            return Err(IdeError::invalid("wait until the agent is done"));
+        }
+        let live = source.ensure_session().await.map_err(IdeError::internal)?;
+        let total = turn_starts(&source.state.lock().conversation.main.entries).len() as u32;
+        let keep = turns.unwrap_or(total).min(total);
+        if !live.capabilities.fork || (keep < total && !live.capabilities.rollback) {
+            return Err(IdeError::invalid("this agent can't copy a conversation from there"));
+        }
+        let cwd = source.state.lock().task.cwd.0.clone();
+        let cwd_s = dunce::canonicalize(&cwd).unwrap_or(cwd).to_string_lossy().into_owned();
+        let reply: Value = live
+            .peer
+            .request("session/fork", json!({ "sessionId": live.session, "cwd": cwd_s, "mcpServers": [] }), None)
+            .await
+            .map_err(|e| IdeError::internal(source.describe(e)))?;
+        let session = reply
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| IdeError::internal("the agent returned no session"))?
+            .to_owned();
+        let file = {
+            let s = source.state.lock();
+            let mut entries = s.conversation.main.entries.clone();
+            if let Some(&cut) = turn_starts(&entries).get(keep as usize) {
+                entries.truncate(cut);
+            }
+            let now = now_ms();
+            let task = AgentTask {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                status: AgentStatus::Ready,
+                error: None,
+                created_ms: now,
+                updated_ms: now,
+                usage: None,
+                queue: Vec::new(),
+                resets_ms: None,
+                retry: None,
+                ..s.task.clone()
+            };
+            TaskFile {
+                task,
+                session_id: Some(session),
+                entries,
+                wanted: s.wanted.clone(),
+                before: (*s.before).clone(),
+                subagents: s.conversation.saved_subagents(),
+                pending_rollback: total - keep,
+            }
+        };
+        let task = Task::restore(file, self.shared.clone());
+        self.tasks.write().insert(task.id.clone(), task.clone());
+        task.persist();
+        task.emit_task();
+        let copy = task.state.lock().task.clone();
+        Ok(copy)
+    }
+
+    /// Drops the task's turns after its first `turns`, in the agent's session and in the
+    /// conversation; returns the message that started the first dropped turn. Files the
+    /// agent changed stay as they are.
+    pub async fn rollback(&self, id: &str, turns: u32) -> IdeResult<Option<AgentPrompt>> {
+        let task = self.task(id)?;
+        if task.state.lock().busy {
+            return Err(IdeError::invalid("wait until the agent is done"));
+        }
+        let live = task.ensure_session().await.map_err(IdeError::internal)?;
+        if !live.capabilities.rollback {
+            return Err(IdeError::invalid("this agent can't undo turns"));
+        }
+        let starts = turn_starts(&task.state.lock().conversation.main.entries);
+        let Some(&cut) = starts.get(turns as usize) else { return Ok(None) };
+        let drop = (starts.len() - turns as usize) as u32;
+        let _: Value = live
+            .peer
+            .request("_openidea/rollback", json!({ "sessionId": live.session, "turns": drop }), None)
+            .await
+            .map_err(|e| IdeError::internal(task.describe(e)))?;
+        let first = {
+            let mut s = task.state.lock();
+            let first = match s.conversation.main.entries.get(cut) {
+                Some(AgentEntry::User { text, .. }) => Some(AgentPrompt { text: text.clone(), ..Default::default() }),
+                _ => None,
+            };
+            s.conversation.truncate(cut);
+            s.task.updated_ms = now_ms();
+            first
+        };
+        task.persist();
+        self.shared.emit(AgentEvent::Truncated { task: id.to_owned(), length: cut as u32 });
+        task.emit_task();
+        Ok(first)
+    }
+
+    /// What `provider` reports about itself, from `initialize` alone: no session is opened,
+    /// so no MCP server, hook or sign-in runs. Remembered until `refresh`.
+    pub async fn probe(&self, provider: &str, refresh: bool) -> IdeResult<AgentProbe> {
+        if !refresh && let Some(p) = self.shared.probes.lock().get(provider) {
+            return Ok(p.clone());
+        }
+        let spec = self.shared.spec(provider).ok_or_else(|| IdeError::invalid(format!("unknown agent {provider}")))?;
+        let mut probe = AgentProbe {
+            provider: spec.id.clone(),
+            name: None,
+            version: None,
+            protocol: match spec.driver {
+                provider::Driver::Acp => "ACP".into(),
+                _ => "native".into(),
+            },
+            capabilities: AgentCapabilities::default(),
+            auth_methods: Vec::new(),
+            error: None,
+        };
+        let stderr: Arc<Mutex<Vec<String>>> = Arc::default();
+        let lines = stderr.clone();
+        let on_stderr: Box<dyn Fn(String) + Send + Sync> = Box::new(move |l| lines.lock().push(l));
+        let started = (self.shared.connector)(
+            &spec,
+            &self.shared.paths.project_root,
+            Arc::new(ide_jsonrpc::NoopHandler),
+            on_stderr,
+        );
+        let reply = match started {
+            Err(e) => Err(format!("Couldn't start {} (`{}`): {e}", spec.name, spec.command)),
+            Ok(peer) => {
+                let params = acp::initialize_params(&client_info());
+                let r = tokio::time::timeout(PROBE_TIMEOUT, peer.request::<_, Value>("initialize", params, None)).await;
+                peer.kill();
+                match r {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(e)) => Err(match stderr.lock().last() {
+                        Some(line) => format!("{e}: {line}"),
+                        None => e.to_string(),
+                    }),
+                    Err(_) => Err("the agent did not answer".into()),
+                }
+            }
+        };
+        match reply {
+            Ok(reply) => {
+                let init = acp::Negotiated::from_initialize(&reply);
+                let info = init.agent_info.clone().unwrap_or_default();
+                let text = |k: &str| info.get(k).and_then(Value::as_str).map(str::to_owned);
+                probe.name = text("title").or_else(|| text("name"));
+                probe.version = text("version");
+                if spec.driver == provider::Driver::Acp {
+                    probe.protocol = format!("ACP v{}", init.generation);
+                }
+                probe.capabilities = capabilities_of(&init).0;
+                probe.auth_methods = init
+                    .auth_methods
+                    .iter()
+                    .filter_map(|m| m.get("name").or_else(|| m.get("id")).and_then(Value::as_str).map(str::to_owned))
+                    .collect();
+            }
+            Err(e) => probe.error = Some(e),
+        }
+        self.shared.probes.lock().insert(spec.id, probe.clone());
+        Ok(probe)
+    }
+
     /// Stops the current turn (`session/cancel`); pending permission requests are cancelled.
     /// Queued messages stay queued. With `subagent`, stops only that subagent's work.
     pub fn cancel(&self, id: &str, subagent: Option<String>) -> IdeResult<()> {
@@ -545,7 +749,9 @@ impl AgentManager {
             let s = task.state.lock();
             (s.task.isolation, s.task.cwd.0.clone())
         };
-        if remove_worktree && isolation == Isolation::Worktree && cwd.exists() {
+        // A copy of the task (a fork) may work in the same worktree.
+        let shared = self.tasks.read().values().any(|t| t.id != id && t.state.lock().task.cwd.0 == cwd);
+        if remove_worktree && !shared && isolation == Isolation::Worktree && cwd.exists() {
             let root = self.shared.paths.project_root.clone();
             blocking(move || worktree::remove(&root, &cwd)).await?;
         }
@@ -594,6 +800,7 @@ impl Task {
                 conversation,
                 wanted: file.wanted,
                 before: Arc::new(file.before),
+                pending_rollback: file.pending_rollback,
                 busy: false,
             }),
             live: Mutex::new(None),
@@ -602,6 +809,9 @@ impl Task {
             next_permission: AtomicU32::new(1),
             replaying: AtomicBool::new(false),
             send_now: AtomicBool::new(false),
+            cancel_pending: AtomicBool::new(false),
+            turn_started: AtomicBool::new(false),
+            config_sent: Mutex::new(HashSet::new()),
             dirty: Mutex::new(BTreeSet::new()),
             flush_scheduled: AtomicBool::new(false),
             stderr: Mutex::new(VecDeque::new()),
@@ -625,9 +835,22 @@ impl Task {
         self.shared.emit(AgentEvent::Task { task });
     }
 
+    /// Shows (or clears) the agent's pending retry; emitted only when it changes.
+    fn set_retry(&self, retry: Option<AgentRetry>) {
+        {
+            let mut s = self.state.lock();
+            if s.task.retry == retry {
+                return;
+            }
+            s.task.retry = retry;
+        }
+        self.emit_task();
+    }
+
     fn set_status(&self, status: AgentStatus, error: Option<String>) {
         {
             let mut s = self.state.lock();
+            s.task.retry = None;
             s.task.status = status;
             s.task.error = error;
             s.task.updated_ms = now_ms();
@@ -652,6 +875,7 @@ impl Task {
                 wanted: s.wanted.clone(),
                 before: (*s.before).clone(),
                 subagents: s.conversation.saved_subagents(),
+                pending_rollback: s.pending_rollback,
             })
         };
         let path = self.shared.paths.store_dir.join(format!("{}.json", self.id));
@@ -700,6 +924,7 @@ impl Task {
     async fn run(self: Arc<Self>, mut prompt: AgentPrompt) {
         loop {
             let result = self.turn(&prompt).await;
+            self.cancel_pending.store(false, Ordering::Release);
             tokio::time::sleep(TURN_GRACE).await;
             let changed = self.state.lock().conversation.end_turn(Some(now_ms()));
             self.mark_dirty(changed);
@@ -729,16 +954,72 @@ impl Task {
             match (next, result) {
                 (Some(queued), _) => prompt = queued.prompt,
                 (None, Ok(_)) => return self.set_status(AgentStatus::Ready, None),
-                (None, Err(message)) => {
-                    self.push_entry(AgentEntry::Error { message: message.clone() });
-                    return self.set_status(AgentStatus::Failed, Some(message));
-                }
+                (None, Err(failure)) => return self.fail(failure),
             }
         }
     }
 
+    /// Ends a turn that failed: nothing it started stays open.
+    fn fail(self: &Arc<Self>, failure: Failure) {
+        self.cancel_permissions();
+        let gone = self.live.lock().as_ref().is_none_or(|l| l.peer.is_closed());
+        if gone {
+            let changed = self.state.lock().conversation.settle(now_ms());
+            self.mark_dirty(changed);
+        }
+        self.push_entry(AgentEntry::Error { message: failure.message.clone() });
+        // The next message starts the agent again (loading the session): what failed may
+        // be fixed outside it meanwhile (signed in, updated, another model chosen).
+        if !gone && let Some(live) = self.live.lock().take() {
+            live.peer.kill();
+        }
+        match failure.limit {
+            Some(resets) => {
+                self.state.lock().task.resets_ms = resets;
+                self.set_status(AgentStatus::Limited, Some(failure.message));
+            }
+            None => self.set_status(AgentStatus::Failed, Some(failure.message)),
+        }
+    }
+
+    /// Adds `prompt` to the running turn when the agent takes that; gives it back otherwise.
+    async fn steer(self: &Arc<Self>, prompt: AgentPrompt) -> Result<(), AgentPrompt> {
+        let live = self.live.lock().clone().filter(|l| l.capabilities.steer && !l.peer.is_closed());
+        let running = {
+            let s = self.state.lock();
+            s.busy && s.task.status == AgentStatus::Running
+        };
+        let Some(live) = live.filter(|l| running && (prompt.images.is_empty() || l.capabilities.images)) else {
+            return Err(prompt);
+        };
+        let content = self.content(&live, &prompt).await;
+        let sent: Result<Value, RpcError> =
+            live.peer.request("_openidea/steer", json!({ "sessionId": live.session, "prompt": content }), None).await;
+        if let Err(e) = sent {
+            // The turn ended meanwhile: the message waits for the next one instead.
+            tracing::debug!("agent task {}: steering failed: {e}", self.id);
+            return Err(prompt);
+        }
+        let attachments = prompt
+            .files
+            .iter()
+            .map(|f| file_name(&f.0))
+            .chain(prompt.images.iter().map(|i| i.name.clone().unwrap_or_else(|| "image".into())))
+            .collect();
+        self.push_entry(AgentEntry::User {
+            text: prompt.text,
+            attachments,
+            sent_ms: Some(now_ms()),
+            done_ms: None,
+            steered: true,
+        });
+        Ok(())
+    }
+
     /// Sends one prompt, starting the agent first if needed; returns the stop reason.
-    async fn turn(self: &Arc<Self>, prompt: &AgentPrompt) -> Result<String, String> {
+    async fn turn(self: &Arc<Self>, prompt: &AgentPrompt) -> Result<String, Failure> {
+        self.turn_started.store(false, Ordering::Release);
+        self.state.lock().task.resets_ms = None;
         let attachments = prompt
             .files
             .iter()
@@ -750,36 +1031,59 @@ impl Task {
             attachments,
             sent_ms: Some(now_ms()),
             done_ms: None,
+            steered: false,
         });
         // Launching the agent can take a while (`npx` fetches its adapter on first use).
         let starting = self.live.lock().as_ref().is_none_or(|l| l.peer.is_closed());
         self.set_status(if starting { AgentStatus::Starting } else { AgentStatus::Running }, None);
-        let live = self.ensure_session().await?;
-        self.set_status(AgentStatus::Running, None);
-        if !prompt.images.is_empty() && !live.images {
-            return Err("This agent can't read images.".into());
+        let live = self.ensure_session().await.map_err(Failure::from)?;
+        // Stopped while the agent started: the prompt is never sent.
+        if self.cancel_pending.load(Ordering::Acquire) {
+            return Ok("cancelled".into());
         }
+        self.set_status(AgentStatus::Running, None);
+        if !prompt.images.is_empty() && !live.capabilities.images {
+            return Err(Failure::from("This agent can't read images.".to_owned()));
+        }
+        let content = self.content(&live, prompt).await;
+        let result: Result<Value, RpcError> =
+            live.peer.request("session/prompt", json!({ "sessionId": live.session, "prompt": content }), None).await;
+        match result {
+            Ok(v) => Ok(v.get("stopReason").and_then(Value::as_str).unwrap_or("end_turn").to_owned()),
+            Err(e) => Err(self.failure(e)),
+        }
+    }
+
+    /// The prompt as ACP content blocks for `live`'s agent.
+    async fn content(&self, live: &Live, prompt: &AgentPrompt) -> Vec<Value> {
         let contents = if live.embedded && !prompt.files.is_empty() {
             let files: Vec<PathBuf> = prompt.files.iter().map(|f| f.0.clone()).collect();
             tokio::task::spawn_blocking(move || files.iter().map(|f| embeddable(f)).collect()).await.unwrap_or_default()
         } else {
             Vec::new()
         };
-        let result: Result<Value, RpcError> = live
-            .peer
-            .request("session/prompt", json!({ "sessionId": live.session, "prompt": blocks(prompt, &contents) }), None)
-            .await;
-        match result {
-            Ok(v) => Ok(v.get("stopReason").and_then(Value::as_str).unwrap_or("end_turn").to_owned()),
+        blocks(prompt, &contents)
+    }
+
+    /// What a failed request means for the user: signed out, out of quota, or the agent's message.
+    fn failure(&self, e: RpcError) -> Failure {
+        if let Some(resets) = usage_limit(&e) {
+            let message = match &e {
+                RpcError::Server { message, .. } if !message.is_empty() => message.clone(),
+                _ => "The usage limit was reached.".into(),
+            };
+            return Failure { message, limit: Some(resets) };
+        }
+        match e {
             // Signed out, or the account was refused (Claude Code: "API Error: 403").
-            Err(RpcError::Server { message, .. }) if message.to_lowercase().contains("auth") => {
+            RpcError::Server { message, .. } if message.to_lowercase().contains("auth") => {
                 let provider = self.state.lock().task.provider.clone();
-                Err(match self.shared.spec(&provider) {
+                Failure::from(match self.shared.spec(&provider) {
                     Some(spec) => format!("{} needs you to sign in. {}", spec.name, spec.login_hint),
                     None => message,
                 })
             }
-            Err(e) => Err(self.describe(e)),
+            e => Failure::from(self.describe(e)),
         }
     }
 
@@ -796,6 +1100,7 @@ impl Task {
         };
         let spec = self.shared.spec(&provider_id).ok_or_else(|| format!("unknown agent {provider_id}"))?;
         self.stderr.lock().clear();
+        self.config_sent.lock().clear();
         let weak = Arc::downgrade(self);
         let on_stderr: Box<dyn Fn(String) + Send + Sync> = Box::new(move |line| {
             if let Some(t) = weak.upgrade() {
@@ -806,33 +1111,17 @@ impl Task {
                 buf.push_back(line);
             }
         });
-        let client = Arc::new(Client { task: Arc::downgrade(self) });
-        let peer = (self.shared.connector)(&spec, &cwd, client, on_stderr)
+        // Speaks ACP v1 or v2, whichever the agent chooses; the task sees v1 either way.
+        let client = acp::Dialect::wrap(Arc::new(Client { task: Arc::downgrade(self) }));
+        let peer = (self.shared.connector)(&spec, &cwd, client.clone(), on_stderr)
+            .map(|peer| acp::Conn::new(peer, client))
             .map_err(|e| format!("Couldn't start {} (`{}`): {e}", spec.name, spec.command))?;
 
-        let init: Value = peer
-            .request(
-                "initialize",
-                json!({
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": { "readTextFile": false, "writeTextFile": false },
-                        "terminal": false,
-                        // Subagents as sessions of their own (ACP subagents RFD).
-                        "subagents": {},
-                    },
-                    "clientInfo": { "name": "OpenIDEA", "version": env!("CARGO_PKG_VERSION") },
-                }),
-                None,
-            )
-            .await
-            .map_err(|e| self.describe(e))?;
-        let can_load = init.pointer("/agentCapabilities/loadSession").and_then(Value::as_bool) == Some(true);
-        let capable = |c: &str| {
-            init.pointer(&format!("/agentCapabilities/promptCapabilities/{c}")).and_then(Value::as_bool) == Some(true)
-        };
-        let (images, embedded) = (capable("image"), capable("embeddedContext"));
-        let cwd_s = cwd.to_string_lossy().into_owned();
+        let init = peer.initialize(&client_info()).await.map_err(|e| self.describe(e))?;
+        let can_load = init.load_session();
+        let (capabilities, embedded) = capabilities_of(&init);
+        // Agents that compare canonical paths fail in a symlinked directory (macOS `/tmp`).
+        let cwd_s = dunce::canonicalize(&cwd).unwrap_or(cwd).to_string_lossy().into_owned();
 
         let mut session = None;
         if let (Some(id), true) = (saved, can_load) {
@@ -846,6 +1135,7 @@ impl Task {
                 Err(e) => tracing::info!("agent task {}: session/load failed, starting a new session: {e}", self.id),
             }
         }
+        let resumed = session.is_some();
         let (session_id, result) = match session {
             Some(s) => s,
             None => {
@@ -863,6 +1153,19 @@ impl Task {
             }
         };
 
+        // A fork of an earlier point: the copied session still has the later turns.
+        let pending = std::mem::take(&mut self.state.lock().pending_rollback);
+        if pending > 0 {
+            if resumed && capabilities.rollback {
+                let params = json!({ "sessionId": session_id, "turns": pending });
+                if let Err(e) = peer.request::<_, Value>("_openidea/rollback", params, None).await {
+                    tracing::warn!("agent task {}: dropping {pending} forked turns failed: {e}", self.id);
+                }
+            } else {
+                tracing::warn!("agent task {}: can't drop {pending} forked turns", self.id);
+            }
+        }
+
         // The session's settings, then the user's choices on top.
         // A session that reports none keeps the last known ones, but what is set is unknown.
         let reported = config::options_of(&result);
@@ -873,11 +1176,13 @@ impl Task {
         };
         self.shared.remember(&provider_id, Some(&options), None);
         for choice in &wanted {
+            // An option the session doesn't offer yet is set once it does (`apply_late_choices`).
             let Some(o) = options.iter().find(|o| o.id == choice.id).cloned() else { continue };
             let already = known && o.current.as_deref() == Some(choice.value.as_str());
             if already || !o.values.iter().any(|v| v.value == choice.value) {
                 continue;
             }
+            self.config_sent.lock().insert((choice.id.clone(), choice.value.clone()));
             let (method, mut params) = config::set_request(&o, &choice.value);
             params["sessionId"] = json!(session_id);
             match peer.request::<_, Value>(method, params, None).await {
@@ -896,13 +1201,59 @@ impl Task {
             let mut s = self.state.lock();
             s.task.model = model_of(&options).or(s.task.model.take());
             s.task.config = options;
+            s.task.capabilities = capabilities;
             s.session_id = Some(session_id.clone());
         }
         self.persist();
         self.emit_task();
-        let live = Live { peer, session: session_id, images, embedded };
+        let live = Live { peer, session: session_id, capabilities, embedded };
         *self.live.lock() = Some(live.clone());
         Ok(live)
+    }
+
+    /// Sends the user's choices that the session offers only now: an option advertised
+    /// after the session started, or a value that appears once a model that has it runs.
+    fn apply_late_choices(self: &Arc<Self>) {
+        let Some(live) = self.live.lock().clone().filter(|l| !l.peer.is_closed()) else { return };
+        let due: Vec<(AgentConfigOption, String)> = {
+            let s = self.state.lock();
+            let mut sent = self.config_sent.lock();
+            s.wanted
+                .iter()
+                .filter_map(|c| {
+                    let o = s.task.config.iter().find(|o| o.id == c.id)?;
+                    let due = o.current.as_deref() != Some(c.value.as_str())
+                        && o.values.iter().any(|v| v.value == c.value)
+                        && sent.insert((c.id.clone(), c.value.clone()));
+                    due.then(|| (o.clone(), c.value.clone()))
+                })
+                .collect()
+        };
+        if due.is_empty() {
+            return;
+        }
+        let task = self.clone();
+        self.shared.runtime.spawn(async move {
+            for (option, value) in due {
+                let (method, mut params) = config::set_request(&option, &value);
+                params["sessionId"] = json!(live.session);
+                match live.peer.request::<_, Value>(method, params, None).await {
+                    Ok(reply) => {
+                        let mut s = task.state.lock();
+                        if let Some(fresh) = reply.get("configOptions") {
+                            config::merge_update(&mut s.task.config, fresh);
+                        }
+                        if let Some(o) = s.task.config.iter_mut().find(|o| o.id == option.id) {
+                            o.current = Some(value);
+                        }
+                        s.task.model = model_of(&s.task.config).or(s.task.model.take());
+                    }
+                    Err(e) => tracing::warn!("agent task {}: setting {} to {value} failed: {e}", task.id, option.id),
+                }
+            }
+            task.persist();
+            task.emit_task();
+        });
     }
 
     /// A user-facing message for a failed request, with the agent's last stderr lines when it died.
@@ -928,6 +1279,12 @@ impl Task {
         if self.state.lock().conversation.owner(session).is_some() {
             if !SESSION_STATE.contains(&kind) && !self.replaying.load(Ordering::Acquire) {
                 self.apply(session, kind, update);
+            }
+            return;
+        }
+        if kind == RETRY_UPDATE {
+            if !self.replaying.load(Ordering::Acquire) {
+                self.set_retry(retry_of(update, now_ms()));
             }
             return;
         }
@@ -980,15 +1337,27 @@ impl Task {
                 self.persist();
             }
             self.emit_task();
+            if kind == "config_option_update" && !self.replaying.load(Ordering::Acquire) {
+                self.apply_late_choices();
+            }
             return;
         }
         if self.replaying.load(Ordering::Acquire) {
             return;
         }
+        // The first sign that the agent took the prompt: a stop sent before it is repeated.
+        if !self.turn_started.swap(true, Ordering::AcqRel)
+            && self.cancel_pending.load(Ordering::Acquire)
+            && let Some(live) = self.live.lock().clone()
+        {
+            let _ = live.peer.notify("session/cancel", json!({ "sessionId": live.session }));
+        }
         self.apply(session, kind, update);
     }
 
     fn apply(self: &Arc<Self>, session: Option<&str>, kind: &str, update: &Value) {
+        // Output again: the retried request went through.
+        self.set_retry(None);
         let applied = self.state.lock().conversation.apply(session, update, now_ms());
         self.mark_dirty(applied);
         // A subagent can start or finish after the turn that started it: saved right away.
@@ -1061,6 +1430,10 @@ impl Task {
     }
 
     fn cancel(&self) {
+        // Also before the turn has started; nothing to stop when idle.
+        if self.state.lock().busy {
+            self.cancel_pending.store(true, Ordering::Release);
+        }
         self.cancel_permissions();
         if let Some(live) = self.live.lock().clone() {
             let _ = live.peer.notify("session/cancel", json!({ "sessionId": live.session }));
@@ -1152,6 +1525,74 @@ fn upgrade(mut file: Value) -> Value {
     file
 }
 
+/// Why a turn failed.
+struct Failure {
+    message: String,
+    /// The usage limit was reached: `Some(when it resets, if known)`.
+    limit: Option<Option<f64>>,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self { message, limit: None }
+    }
+}
+
+/// Whether `e` reports a usage or rate limit, and when it resets: as native agents report
+/// it (`data.openidea.usageLimit.resetsAtMs`), or as ACP agents word it.
+fn usage_limit(e: &RpcError) -> Option<Option<f64>> {
+    let RpcError::Server { message, data, .. } = e else { return None };
+    if let Some(limit) = data.as_ref().and_then(|d| d.pointer("/openidea/usageLimit")) {
+        return Some(limit.get("resetsAtMs").and_then(Value::as_f64));
+    }
+    let m = message.to_lowercase();
+    ["usage limit", "rate limit", "rate_limit", "quota", "too many requests", "429"]
+        .iter()
+        .any(|k| m.contains(k))
+        .then_some(None)
+}
+
+fn client_info() -> Value {
+    json!({ "name": "OpenIDEA", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// What the agent said it can do, and whether it takes embedded files.
+fn capabilities_of(init: &acp::Negotiated) -> (AgentCapabilities, bool) {
+    let meta = |p: &str| init.meta(p).and_then(Value::as_bool) == Some(true);
+    let capabilities = AgentCapabilities {
+        images: init.prompt("image"),
+        fork: init.session("fork"),
+        rollback: meta("/openidea/rollback"),
+        steer: meta("/openidea/steer"),
+    };
+    (capabilities, init.prompt("embeddedContext"))
+}
+
+/// The turns of a conversation: the user's messages that started one.
+fn turn_starts(entries: &[AgentEntry]) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, AgentEntry::User { steered: false, .. }))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// The retry a [`RETRY_UPDATE`] announces, timed from `now`.
+fn retry_of(update: &Value, now: f64) -> Option<AgentRetry> {
+    let n = |k: &str| update.get(k).and_then(Value::as_u64);
+    Some(AgentRetry {
+        attempt: u32::try_from(n("attempt")?).unwrap_or(u32::MAX),
+        max_retries: n("maxRetries").and_then(|m| u32::try_from(m).ok()),
+        retry_at_ms: now + n("retryDelayMs").unwrap_or(0) as f64,
+        error: update.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()).map(str::to_owned),
+    })
+}
+
 fn model_of(config: &[AgentConfigOption]) -> Option<String> {
     config.iter().find(|o| o.category.as_deref() == Some("model")).and_then(|o| o.current.clone())
 }
@@ -1202,5 +1643,9 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> IdeResult<T> + Send + '
     tokio::task::spawn_blocking(f).await.map_err(|e| IdeError::internal(e.to_string()))?
 }
 
+#[cfg(test)]
+mod replay;
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod tests;

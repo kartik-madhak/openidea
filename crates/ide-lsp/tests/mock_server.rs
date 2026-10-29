@@ -521,6 +521,20 @@ async fn inline_completion_only_from_servers_that_advertise_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unsupported_feature_names_the_running_servers_that_lack_it() {
+    let h = harness(&[("plain", incremental_caps()), ("other", json!({ "textDocumentSync": 2 }))]);
+    let (doc, _) = h.open("a.mk", "let x = fo");
+    for name in ["plain", "other"] {
+        h.wait_status(name, ServerStatus::Ready).await;
+    }
+    let e = h.mgr.inline_completion(doc, Pos::new(0, 10), false, Default::default()).await.unwrap_err();
+    assert_eq!(e.kind, ide_core::error::ErrorKind::Unavailable);
+    assert_eq!(e.message, "plain, other doesn't support inline completion");
+    let e = h.mgr.type_hierarchy(doc, Pos::new(0, 4), HierarchyDirection::Incoming).await.unwrap_err();
+    assert_eq!(e.message, "plain, other doesn't support type hierarchy");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn diagnostics_become_events_and_feed_code_actions() {
     let h = harness(&[("mock", incremental_caps())]);
     let (doc, path) = h.open("a.mk", "let unused = 1;\nlet y = 2;\n");
@@ -726,6 +740,37 @@ async fn progress_tasks_and_busy_status() {
     assert_eq!(tasks[0], ("Indexing".into(), None, Some(0.0), false));
     assert_eq!(tasks[1], ("Indexing".into(), Some("3/10".into()), Some(0.3), false));
     assert!(tasks[2].3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_cancellable_progress_task_asks_the_server_to_stop() {
+    let h = harness(&[("mock", incremental_caps())]);
+    h.open("a.mk", "x");
+    h.wait_status("mock", ServerStatus::Ready).await;
+    let s = h.launcher.state("mock");
+    let peer = s.peer();
+    let begin = |token: Value, cancellable: bool| json!({ "token": token, "value": { "kind": "begin", "title": "Building", "cancellable": cancellable } });
+    peer.notify("$/progress", begin(json!(7), true)).unwrap();
+    peer.notify("$/progress", begin(json!("plain"), false)).unwrap();
+    let task_of = |want: bool| {
+        h.events.lock().iter().find_map(|e| match e {
+            IdeEvent::Task { id, cancellable, done: false, .. } if *cancellable == want => Some(*id),
+            _ => None,
+        })
+    };
+    eventually(|| task_of(true).is_some() && task_of(false).is_some()).await;
+    let (cancellable, plain) = (task_of(true).unwrap(), task_of(false).unwrap());
+    assert!(!ide_core::task::cancel(plain), "the server did not offer to cancel it");
+    assert!(ide_core::task::cancel(cancellable));
+    eventually(|| !s.notified("window/workDoneProgress/cancel").is_empty()).await;
+    assert_eq!(s.notified("window/workDoneProgress/cancel"), [json!({ "token": 7 })]);
+    // Once it ended there is nothing left to cancel.
+    peer.notify("$/progress", json!({ "token": 7, "value": { "kind": "end" } })).unwrap();
+    eventually(|| {
+        h.events.lock().iter().any(|e| matches!(e, IdeEvent::Task { id, done: true, .. } if *id == cancellable))
+    })
+    .await;
+    assert!(!ide_core::task::cancel(cancellable));
 }
 
 #[tokio::test(flavor = "multi_thread")]

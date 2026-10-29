@@ -179,6 +179,12 @@ function onEvent(e: AgentEvent) {
       editorService().closeInput?.(sessionKey(e.id));
       break;
     }
+    case "truncated": {
+      const current = s.entries.get(e.task);
+      if (current) useAgents.setState({ entries: new Map(s.entries).set(e.task, current.slice(0, e.length)) });
+      scheduleChanges(e.task);
+      break;
+    }
     case "entry": {
       const key = entriesKey(e.task, e.subagent);
       const current = s.entries.get(key);
@@ -243,7 +249,8 @@ function scheduleChanges(task: string) {
   );
 }
 
-async function refreshProviders() {
+/** Reloads the agent list (custom and registry agents are re-read). */
+export async function refreshProviders() {
   const providers = await call(commands.agentProviders()).catch(() => null);
   if (providers) useAgents.setState({ providers });
 }
@@ -338,11 +345,41 @@ export function quoteInComposer(task: string, text: string) {
   focusComposer(task);
 }
 
-/** Puts an earlier message back into the composer to edit and send again. */
-export function editMessage(task: string, text: string) {
-  const current = composerDraft(task).text;
-  updateComposer(task, { text: current.trim() ? `${text}\n${current}` : text });
-  focusComposer(task);
+/** Copies the task's conversation into a new task (up to its first `turns` turns) and opens it. */
+export async function forkTask(task: string, turns: number | null): Promise<void> {
+  const copy = await call(commands.agentFork(task, turns));
+  useAgents.setState((s) => ({
+    tasks: s.tasks.has(copy.id) ? s.tasks : new Map(s.tasks).set(copy.id, copy),
+  }));
+  openTask(copy.id);
+}
+
+/**
+ * Runs the conversation again from turn `turn` with `text` as its message: the agent is
+ * stopped if it works, that turn and the later ones are dropped, then `text` is sent.
+ */
+export async function rerunFrom(task: string, turn: number, text: string): Promise<void> {
+  if (isBusy(useAgents.getState().tasks.get(task)?.status ?? "ready")) {
+    await cancelTask(task);
+    await settled(task);
+  }
+  await call(commands.agentRollback(task, turn));
+  await call(commands.agentPrompt(task, { text, files: [], images: [] }, false));
+}
+
+/** Resolves once the task's turn has ended (or after a while). */
+function settled(task: string, timeoutMs = 15_000): Promise<void> {
+  const done = () => !isBusy(useAgents.getState().tasks.get(task)?.status ?? "ready");
+  if (done()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      stop();
+      clearTimeout(timer);
+      resolve();
+    };
+    const stop = useAgents.subscribe(() => done() && finish());
+    const timer = setTimeout(finish, timeoutMs);
+  });
 }
 
 /** Sends an earlier message again (queued while the agent works). */

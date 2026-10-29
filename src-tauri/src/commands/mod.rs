@@ -19,6 +19,8 @@ pub mod debug;
 pub mod deploy;
 pub mod doc;
 pub mod docker;
+pub mod env;
+pub mod fonts;
 pub mod fs;
 pub mod github;
 pub mod history;
@@ -71,9 +73,13 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         app::project_rename,
         app::project_roots,
         app::cancel_request,
+        app::cancel_task,
         app::log_frontend,
         agent::agent_subscribe,
         agent::agent_providers,
+        agent::agent_registry_list,
+        agent::agent_registry_install,
+        agent::agent_registry_remove,
         agent::agent_commands,
         agent::agent_entries,
         agent::agent_create,
@@ -81,6 +87,9 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         agent::agent_unqueue,
         agent::agent_send_queued_now,
         agent::agent_set_config,
+        agent::agent_fork,
+        agent::agent_rollback,
+        agent::agent_probe,
         agent::agent_cancel,
         agent::agent_respond,
         agent::agent_archive,
@@ -101,6 +110,7 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         clipboard::clipboard_file_list,
         clipboard::clipboard_has_files,
         clipboard::clipboard_set_file_list,
+        fonts::system_font_families,
         doc::doc_open,
         doc::doc_open_virtual,
         doc::doc_close,
@@ -258,6 +268,7 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         run::run_list,
         run::run_close_stdin,
         run::run_resize,
+        run::run_gradle_jvm_args_script,
         run::run_test_reports,
         build::build_model,
         build::build_sync,
@@ -386,6 +397,7 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         http::http_history,
         http::http_history_get,
         http::http_history_clear,
+        http::proxy_check_connection,
         db::db_sources,
         db::db_save_sources,
         db::db_set_password,
@@ -416,6 +428,7 @@ pub fn builder() -> tauri_specta::Builder<tauri::Wry> {
         crate::remote_dev::remote_current,
         crate::remote_dev::remote_disconnect,
         crate::remote_dev::remote_invoke,
+        env::env_reload,
         db::db_test,
         db::db_connected,
         db::db_connect,

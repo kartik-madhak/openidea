@@ -75,6 +75,8 @@ impl Host {
         }
         self.close_project(window);
         let sink: SharedSink = (self.sink_for)(window);
+        // Before anything the project starts: its children get the project's environment.
+        let post_start = self.environment.project_opened(&root, &sink);
         let settings = SettingsStore::load(&self.config_dir, Some(&root));
         let detected_roots = Arc::new(RwLock::new(ide_workspace::roots::detect(&root)));
         let excludes = exclude_globs(&settings.effective(), &detected_roots.read());
@@ -280,6 +282,7 @@ impl Host {
         tracing::info!("opened {} in window {window} in {} ms {laps:?}", root.display(), started.elapsed().as_millis());
 
         let (db, http_history, agents) = self.project_services(&root, &project_key);
+        ide_agent::registry::maintain(crate::ops::agent::registry_paths(self));
         let project = Arc::new(Project {
             root,
             sink,
@@ -310,6 +313,9 @@ impl Host {
             }));
         }
         self.insert_project(window, project.clone());
+        if let Some(cmd) = post_start {
+            self.environment.spawn_post_start(cmd, project.root.clone(), project.sink.clone());
+        }
         Ok(project)
     }
 
