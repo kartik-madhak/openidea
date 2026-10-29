@@ -49,6 +49,8 @@ import styles from "./LineMarkers.module.css";
 const MARGIN_LINES = 60;
 const MAX_PER_PASS = 60;
 const DEBOUNCE_MS = 500;
+const BACKOFF_MS = 30_000;
+const gutterBackoff = new Map<number, number>();
 
 /** Settings › Editor › General › Gutter Icons groups that are on. */
 export function enabledGroups(prefs: Pick<EditorExtras, "showGutterIcons" | "gutterIconsDisabled">): Set<MarkerGroup> {
@@ -279,7 +281,7 @@ class MarkersPlugin {
     const gen = ++this.generation;
     this.cancelRequest();
     const groups = enabledGroups(editorPrefs());
-    if (!groups.size || serverBackoff.active(ctx.doc)) {
+    if (!groups.size || serverBackoff.active(ctx.doc) || (gutterBackoff.get(ctx.doc) ?? 0) > Date.now()) {
       if (!groups.size) this.show([]);
       return;
     }
@@ -310,7 +312,7 @@ class MarkersPlugin {
       if (stale()) return;
       this.show(place(text, cachedMarkers(candidates, groups, this.cache)));
     } catch (e) {
-      if (isUnavailable(e)) serverBackoff.mark(ctx.doc);
+      if (isUnavailable(e)) gutterBackoff.set(ctx.doc, Date.now() + BACKOFF_MS);
       else if (!isCancelled(e)) console.debug("[lineMarkers]", e);
     }
   }

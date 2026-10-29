@@ -417,7 +417,6 @@ async function lspCompletionSource(ctx: CompletionContext): Promise<CompletionRe
   const trigger = triggerCharacter(ctx.state.sliceDoc(Math.max(0, ctx.pos - 2), ctx.pos));
   if (!ctx.explicit && !word && !trigger) return null;
   if (!ctx.explicit && word && !trigger && /^\d/.test(word.text)) return null;
-  if (serverBackoff.active(doc.doc)) return fallback(ctx);
 
   cancelInflight();
   const id = nextRequestId();

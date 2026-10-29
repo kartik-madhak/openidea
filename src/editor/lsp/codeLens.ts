@@ -35,6 +35,8 @@ const MAX_PER_PASS = 40;
 const CONCURRENCY = 4;
 /** Lines above/below the viewport that are counted too, so scrolling feels instant. */
 const MARGIN_LINES = 60;
+const BACKOFF_MS = 30_000;
+const codeLensBackoff = new Map<number, number>();
 
 export interface LensTarget {
   name: string;
@@ -138,7 +140,7 @@ class UsagesLensPlugin {
     const doc = docOf(view);
     if (!doc) return;
     const gen = ++this.generation;
-    const usages = usagesEnabled() && !serverBackoff.active(doc.doc);
+    const usages = usagesEnabled() && !serverBackoff.active(doc.doc) && (codeLensBackoff.get(doc.doc) ?? 0) <= Date.now();
     const authors = authorEnabled() && !doc.virtual;
     if (!usages && !authors) {
       if (view.state.field(lensField).length) view.dispatch({ effects: setLenses.of([]) });
@@ -181,7 +183,7 @@ class UsagesLensPlugin {
         );
         if (gen !== this.generation || view.state.doc !== text) return;
       }
-      if (unavailable) serverBackoff.mark(doc.doc);
+      if (unavailable) codeLensBackoff.set(doc.doc, Date.now() + BACKOFF_MS);
       const lines = await blame;
       if (gen !== this.generation || view.state.doc !== text) return;
       const lenses: CodeLens[] = [];
@@ -202,7 +204,7 @@ class UsagesLensPlugin {
       }
       if (!sameLenses(view.state.field(lensField), lenses)) view.dispatch({ effects: setLenses.of(lenses) });
     } catch (e) {
-      if (isUnavailable(e)) serverBackoff.mark(doc.doc);
+      if (isUnavailable(e)) codeLensBackoff.set(doc.doc, Date.now() + BACKOFF_MS);
     }
   }
 

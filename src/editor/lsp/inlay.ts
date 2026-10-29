@@ -30,6 +30,9 @@ async function setEditorSetting(key: string, value: unknown) {
   useProject.setState({ settings: await call(commands.settingsSet("global", `editor.${key}`, JSON.stringify(value))) });
 }
 
+const BACKOFF_MS = 30_000;
+const inlayBackoff = new Map<number, number>();
+
 /** A type hint after an identifier can resolve that identifier's inferred type. */
 function typeHintOffset(view: EditorView, at: number): number | null {
   if (at <= 0 || at > view.state.doc.length) return null;
@@ -183,7 +186,7 @@ const inlayPlugin = ViewPlugin.fromClass(
       if (!view.dom.isConnected) return;
       const doc = docOf(view);
       if (!doc) return;
-      if (!enabled(doc.language) || serverBackoff.active(doc.doc)) {
+      if (!enabled(doc.language) || serverBackoff.active(doc.doc) || (inlayBackoff.get(doc.doc) ?? 0) > Date.now()) {
         if (view.state.field(inlayField).size) view.dispatch({ effects: setInlays.of(Decoration.none) });
         return;
       }
@@ -203,7 +206,7 @@ const inlayPlugin = ViewPlugin.fromClass(
           ),
         });
       } catch (e) {
-        if (isUnavailable(e)) serverBackoff.mark(doc.doc);
+        if (isUnavailable(e)) inlayBackoff.set(doc.doc, Date.now() + BACKOFF_MS);
       }
     }
     destroy() {
