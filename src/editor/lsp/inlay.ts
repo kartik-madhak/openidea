@@ -15,7 +15,7 @@ import { useProject } from "@/platform/project";
 import { editorPrefs } from "@/platform/editorSettings";
 import { debounce, docOf, isUnavailable, lspRequest } from "./lsp";
 import { offsetsToRange, posToOffset } from "./positions";
-import { onLspRefresh, serverBackoff } from "./availability";
+import { featureBackoff, onLspRefresh } from "./availability";
 import { gotoTargets } from "./navigation";
 import { tx } from "@/platform/i18n";
 
@@ -30,8 +30,7 @@ async function setEditorSetting(key: string, value: unknown) {
   useProject.setState({ settings: await call(commands.settingsSet("global", `editor.${key}`, JSON.stringify(value))) });
 }
 
-const BACKOFF_MS = 30_000;
-const inlayBackoff = new Map<number, number>();
+const inlayBackoff = featureBackoff();
 
 /** A type hint after an identifier can resolve that identifier's inferred type. */
 function typeHintOffset(view: EditorView, at: number): number | null {
@@ -186,7 +185,7 @@ const inlayPlugin = ViewPlugin.fromClass(
       if (!view.dom.isConnected) return;
       const doc = docOf(view);
       if (!doc) return;
-      if (!enabled(doc.language) || serverBackoff.active(doc.doc) || (inlayBackoff.get(doc.doc) ?? 0) > Date.now()) {
+      if (!enabled(doc.language) || inlayBackoff.active(doc.doc)) {
         if (view.state.field(inlayField).size) view.dispatch({ effects: setInlays.of(Decoration.none) });
         return;
       }
@@ -206,7 +205,7 @@ const inlayPlugin = ViewPlugin.fromClass(
           ),
         });
       } catch (e) {
-        if (isUnavailable(e)) inlayBackoff.set(doc.doc, Date.now() + BACKOFF_MS);
+        if (isUnavailable(e)) inlayBackoff.mark(doc.doc);
       }
     }
     destroy() {
